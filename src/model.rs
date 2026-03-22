@@ -6,6 +6,7 @@ use burn::{
     },
     tensor::{backend::Backend, activation, Int, Tensor},
 };
+use rand::distr::{Distribution, weighted::WeightedIndex};
 
 #[derive(Config, Debug)]
 pub struct GPTConfig {
@@ -50,10 +51,11 @@ impl<B: Backend> CausalSelfAttention<B> {
         let qkv = self.c_attn.forward(x.clone());
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.n_head, head_dim]);
         
-        let qkv = qkv.permute([2, 0, 3, 1, 4]); 
-        let q = qkv.clone().slice([0..1]).squeeze::<4>();
-        let k = qkv.clone().slice([1..2]).squeeze::<4>();
-        let v = qkv.clone().slice([2..3]).squeeze::<4>();
+        let qkv = qkv.permute([2, 0, 3, 1, 4]);
+        // Use reshape instead of squeeze to avoid ambiguity when batch or seq_len == 1
+        let q = qkv.clone().slice([0..1]).reshape([batch_size, self.n_head, seq_len, head_dim]);
+        let k = qkv.clone().slice([1..2]).reshape([batch_size, self.n_head, seq_len, head_dim]);
+        let v = qkv.clone().slice([2..3]).reshape([batch_size, self.n_head, seq_len, head_dim]);
 
         // Scaled dot product attention
         let scale = (head_dim as f64).powf(-0.5);
@@ -178,23 +180,53 @@ impl<B: Backend> GPT<B> {
         self.lm_head.forward(x)
     }
 
-    pub fn generate(&self, idx: Tensor<B, 2, Int>, max_new_tokens: usize, temperature: f64, block_size: usize) -> Tensor<B, 2, Int> {
+    pub fn generate(
+        &self,
+        idx: Tensor<B, 2, Int>,
+        max_new_tokens: usize,
+        temperature: f64,
+        block_size: usize,
+    ) -> Tensor<B, 2, Int> {
         let mut idx = idx;
+        let mut rng = rand::rng();
+
         for _ in 0..max_new_tokens {
-            let [_, seq_len] = idx.dims();
-            
+            let [batch, seq_len] = idx.dims();
+
             let idx_cond = if seq_len > block_size {
-                idx.clone().slice([0..idx.dims()[0], seq_len - block_size..seq_len])
+                idx.clone().slice([0..batch, seq_len - block_size..seq_len])
             } else {
                 idx.clone()
             };
 
             let logits = self.forward(idx_cond);
-            let [batch, len, vocab] = logits.dims();
-            let logits = logits.slice([0..batch, len-1..len, 0..vocab]).squeeze::<2>();
-            
-            let logits = logits / temperature;
-            let idx_next = logits.argmax(1).unsqueeze::<2>();
+            let [_, len, vocab] = logits.dims();
+            // Take logits of the last position: [batch, vocab]
+            let logits = logits
+                .slice([0..batch, len - 1..len, 0..vocab])
+                .reshape([batch, vocab]);
+
+            // Scale by temperature then sample (or greedy when temp ~= 0)
+            let idx_next = if temperature < 1e-6 {
+                logits.argmax(1).unsqueeze::<2>()
+            } else {
+                let logits = logits / temperature;
+                let probs = activation::softmax(logits, 1);
+                let probs_data = probs.into_data();
+                let probs_f32 = probs_data.as_slice::<f32>().expect("f32 probs");
+
+                // Sample one token per batch element
+                let tokens: Vec<i32> = (0..batch)
+                    .map(|b| {
+                        let row = &probs_f32[b * vocab..(b + 1) * vocab];
+                        let dist = WeightedIndex::new(row).expect("valid weights");
+                        dist.sample(&mut rng) as i32
+                    })
+                    .collect();
+
+                Tensor::<B, 1, Int>::from_ints(tokens.as_slice(), &idx.device())
+                    .unsqueeze::<2>()
+            };
 
             idx = Tensor::cat(vec![idx, idx_next], 1);
         }

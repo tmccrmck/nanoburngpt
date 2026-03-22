@@ -1,1 +1,14 @@
-/target
+# Rust build output
+/target/
+
+# Jujutsu VCS internal directory
+/.jj/
+
+# Training artifacts (model weights, checkpoints, logs)
+/artifacts/
+
+# Downloaded datasets
+/data/
+
+# Editor/OS
+.DS_Store

@@ -47,10 +47,22 @@ impl CharTokenizer {
             .map(|i| *self.idx_to_char.get(i).unwrap_or(&'?'))
             .collect()
     }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let json = serde_json::to_string(self)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let json = fs::read_to_string(path)?;
+        let tokenizer = serde_json::from_str(&json)?;
+        Ok(tokenizer)
+    }
 }
 
 pub struct TextDataset {
-    data: Vec<usize>,
+    pub data: Vec<usize>,
     block_size: usize,
 }
 

@@ -6,6 +6,9 @@
 
 # Training artifacts (model weights, checkpoints, logs)
 /artifacts/
+/artifacts/train/
+/artifacts/valid/
+/artifacts/experiment.log
 
 # Downloaded datasets
 /data/

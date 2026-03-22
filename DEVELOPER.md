@@ -60,6 +60,28 @@ Several API changes from older Burn versions were resolved during implementation
 **Dropout**
 - `Dropout::forward` is a no-op when `B::ad_enabled() == false` (i.e. on non-autodiff backends). Inference is automatically correct — no explicit eval mode needed.
 
+## LR Schedule
+
+`WarmupCosineScheduler` in `src/train.rs` implements nanoGPT's schedule:
+1. **Linear warmup** — steps `0..warmup_iters`: ramps from 0 → `learning_rate`
+2. **Cosine decay** — steps `warmup_iters..total_iters`: decays from `learning_rate` → `min_lr`
+3. **Hold** — steps beyond `total_iters`: stays at `min_lr`
+
+`total_iters` is computed at runtime as `(dataset_size / batch_size) * num_epochs`.
+
+Burn's built-in `ComposedLrScheduler` combines schedulers in **parallel** (multiply/sum), not sequentially, so a custom scheduler was needed.
+
+## AdamW Hyperparameters
+
+Defaults match nanoGPT:
+
+| Param          | nanoGPT | Burn default | Our default |
+|----------------|---------|--------------|-------------|
+| `beta1`        | 0.9     | 0.9          | 0.9         |
+| `beta2`        | 0.95    | 0.999        | 0.95        |
+| `epsilon`      | 1e-8    | 1e-5         | 1e-8        |
+| `weight_decay` | 0.1     | 1e-4         | 0.1         |
+
 ## Key Constraints
 
 - `n_embd` must be divisible by `n_head` (determines `head_dim = n_embd / n_head`).

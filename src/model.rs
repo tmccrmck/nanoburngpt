@@ -2,7 +2,8 @@ use burn::{
     config::Config,
     module::Module,
     nn::{
-        Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, Dropout, DropoutConfig,
+        Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, LayerNorm,
+        LayerNormConfig, Linear, LinearConfig,
     },
     tensor::{backend::Backend, activation, Int, Tensor},
 };
@@ -30,12 +31,15 @@ pub struct CausalSelfAttention<B: Backend> {
 
 impl<B: Backend> CausalSelfAttention<B> {
     pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
-        let linear_config = LinearConfig::new(config.n_embd, 3 * config.n_embd);
-        let proj_config = LinearConfig::new(config.n_embd, config.n_embd);
-
+        // c_proj is a residual projection — scale down by 1/sqrt(2*n_layer) per nanoGPT
+        let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
         Self {
-            c_attn: linear_config.init(device),
-            c_proj: proj_config.init(device),
+            c_attn: LinearConfig::new(config.n_embd, 3 * config.n_embd)
+                .with_initializer(Initializer::Normal { mean: 0.0, std: 0.02 })
+                .init(device),
+            c_proj: LinearConfig::new(config.n_embd, config.n_embd)
+                .with_initializer(Initializer::Normal { mean: 0.0, std: proj_std })
+                .init(device),
             attn_dropout: DropoutConfig::new(config.dropout).init(),
             resid_dropout: DropoutConfig::new(config.dropout).init(),
             n_head: config.n_head,
@@ -89,9 +93,14 @@ pub struct MLP<B: Backend> {
 
 impl<B: Backend> MLP<B> {
     pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
+        let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
         Self {
-            c_fc: LinearConfig::new(config.n_embd, 4 * config.n_embd).init(device),
-            c_proj: LinearConfig::new(4 * config.n_embd, config.n_embd).init(device),
+            c_fc: LinearConfig::new(config.n_embd, 4 * config.n_embd)
+                .with_initializer(Initializer::Normal { mean: 0.0, std: 0.02 })
+                .init(device),
+            c_proj: LinearConfig::new(4 * config.n_embd, config.n_embd)
+                .with_initializer(Initializer::Normal { mean: 0.0, std: proj_std })
+                .init(device),
             dropout: DropoutConfig::new(config.dropout).init(),
         }
     }
@@ -135,34 +144,30 @@ pub struct GPT<B: Backend> {
     position_embedding: Embedding<B>,
     blocks: Vec<Block<B>>,
     ln_f: LayerNorm<B>,
-    pub lm_head: Linear<B>,
+    // lm_head is weight-tied to token_embedding — no separate parameter
 }
 
 impl<B: Backend> GPT<B> {
     pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
         let token_embedding = EmbeddingConfig::new(config.vocab_size, config.n_embd).init(device);
         let position_embedding = EmbeddingConfig::new(config.block_size, config.n_embd).init(device);
-        
+
         let blocks = (0..config.n_layer)
             .map(|_| Block::new(config, device))
             .collect();
-            
+
         let ln_f = LayerNormConfig::new(config.n_embd).init(device);
-        let lm_head = LinearConfig::new(config.n_embd, config.vocab_size)
-            .with_bias(false)
-            .init(device);
 
         Self {
             token_embedding,
             position_embedding,
             blocks,
             ln_f,
-            lm_head,
         }
     }
 
     pub fn forward(&self, idx: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let [_, seq_len] = idx.dims();
+        let [batch, seq_len] = idx.dims();
         let device = idx.device();
 
         let pos = Tensor::arange(0..seq_len as i64, &device).unsqueeze::<2>();
@@ -177,7 +182,13 @@ impl<B: Backend> GPT<B> {
         }
         
         let x = self.ln_f.forward(x);
-        self.lm_head.forward(x)
+
+        // Weight-tied output projection: x @ token_embedding.weight.T
+        let weight = self.token_embedding.weight.val(); // [vocab_size, n_embd]
+        let [vocab_size, n_embd] = weight.dims();
+        x.reshape([batch * seq_len, n_embd])
+            .matmul(weight.transpose())
+            .reshape([batch, seq_len, vocab_size])
     }
 
     pub fn generate(

@@ -1,0 +1,12 @@
+[package]
+name = "nanoburngpt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+burn = { version = "0.20.1", features = ["train", "tui", "wgpu"] }
+clap = { version = "4.6.0", features = ["derive"] }
+rand = "0.10.0"
+reqwest = { version = "0.13.2", features = ["blocking"] }
+serde = { version = "1.0.228", features = ["derive"] }

@@ -4,6 +4,7 @@ use burn::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
+use tiktoken_rs::r50k_base;
 
 const DATA_URL: &str = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
@@ -155,7 +156,7 @@ pub fn load_shakespeare(path: &Path, block_size: usize) -> anyhow::Result<(TextD
 
     let tokenizer = CharTokenizer::new(&text);
     let data = tokenizer.encode(&text);
-    
+
     // Split 90% train, 10% val
     let n = data.len();
     let split = (n as f64 * 0.9) as usize;
@@ -169,3 +170,49 @@ pub fn load_shakespeare(path: &Path, block_size: usize) -> anyhow::Result<(TextD
     ))
 }
 
+// ---------------------------------------------------------------------------
+// BPE Tokenizer (GPT-2 / r50k_base vocabulary, 50257 tokens)
+// ---------------------------------------------------------------------------
+
+pub struct BpeTokenizer {
+    bpe: tiktoken_rs::CoreBPE,
+}
+
+impl BpeTokenizer {
+    pub fn new() -> Self {
+        Self {
+            bpe: r50k_base().expect("tiktoken r50k_base vocab should load"),
+        }
+    }
+
+    pub fn encode(&self, text: &str) -> Vec<usize> {
+        self.bpe.encode_ordinary(text).into_iter().map(|t| t as usize).collect()
+    }
+
+    pub fn decode(&self, tokens: &[usize]) -> String {
+        self.bpe
+            .decode(tokens.iter().map(|&t| t as u32).collect())
+            .unwrap_or_default()
+    }
+
+    pub const VOCAB_SIZE: usize = 50257;
+}
+
+// ---------------------------------------------------------------------------
+// Generic text-file loader (dataset-agnostic)
+// ---------------------------------------------------------------------------
+
+/// Load a plain-text file, tokenize with BPE, split 90/10 train/val.
+pub fn load_text(path: &Path, block_size: usize) -> anyhow::Result<(TextDataset, TextDataset)> {
+    let text = std::fs::read_to_string(path)?;
+    let tokenizer = BpeTokenizer::new();
+    let data = tokenizer.encode(&text);
+
+    let n = data.len();
+    let split = (n as f64 * 0.9) as usize;
+
+    Ok((
+        TextDataset::new(data[..split].to_vec(), block_size),
+        TextDataset::new(data[split..].to_vec(), block_size),
+    ))
+}

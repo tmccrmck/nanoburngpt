@@ -142,3 +142,61 @@ fn strip_wikitext_markup(text: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn dataset_from_str_shakespeare() {
+        let d = Dataset::from_str("shakespeare").unwrap();
+        assert!(matches!(d, Dataset::Shakespeare));
+    }
+
+    #[test]
+    fn dataset_from_str_wikitext103() {
+        let d = Dataset::from_str("wikitext103").unwrap();
+        assert!(matches!(d, Dataset::WikiText103));
+    }
+
+    #[test]
+    fn dataset_from_str_unknown_errors() {
+        assert!(Dataset::from_str("imagenet").is_err());
+    }
+
+    #[test]
+    fn strip_removes_heading_lines() {
+        let input = "= Heading =\nSome text\n = Sub = \n more text";
+        let out = strip_wikitext_markup(input);
+        assert!(!out.contains("Heading"), "heading should be removed");
+        assert!(out.contains("Some text"));
+        assert!(out.contains("more text"));
+    }
+
+    #[test]
+    fn strip_replaces_at_dash_artifacts() {
+        let input = "2000 @-@ 2001 season";
+        let out = strip_wikitext_markup(input);
+        assert_eq!(out, "2000-2001 season");
+    }
+
+    #[test]
+    fn strip_replaces_at_dot_and_comma_artifacts() {
+        let input = "U @.@ S @.@ A @,@ which";
+        let out = strip_wikitext_markup(input);
+        assert_eq!(out, "U.S.A,which");
+    }
+
+    #[test]
+    fn strip_preserves_non_heading_equals() {
+        // A line with = in the middle but not wrapping both ends should survive.
+        let input = "x = 5\nnormal text";
+        let out = strip_wikitext_markup(input);
+        assert!(out.contains("x = 5"));
+    }
+}

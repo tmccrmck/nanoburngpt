@@ -130,3 +130,57 @@ pub fn load_text(path: &Path, block_size: usize) -> anyhow::Result<(TextDataset,
         TextDataset::new(data[split..].to_vec(), block_size),
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_dataset(n_tokens: usize, block_size: usize) -> TextDataset {
+        let data: Vec<usize> = (0..n_tokens).collect();
+        TextDataset::new(data, block_size)
+    }
+
+    #[test]
+    fn len_is_tokens_minus_block_size() {
+        let ds = make_dataset(10, 3);
+        // 10 - 3 = 7 valid windows
+        assert_eq!(ds.len(), 7);
+    }
+
+    #[test]
+    fn len_zero_when_data_too_short() {
+        let ds = make_dataset(3, 3);
+        assert_eq!(ds.len(), 0);
+    }
+
+    #[test]
+    fn get_returns_correct_input_and_target() {
+        let ds = make_dataset(10, 4);
+        let item = ds.get(0).expect("should exist");
+        // tokens 0..4 → input, tokens 1..5 → target
+        assert_eq!(item.input,  vec![0, 1, 2, 3]);
+        assert_eq!(item.target, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn get_at_last_valid_index() {
+        let block_size = 3;
+        let n = 10;
+        let ds = make_dataset(n, block_size);
+        let last = ds.len() - 1; // index 6: tokens [6,7,8] / [7,8,9]
+        let item = ds.get(last).expect("should exist");
+        assert_eq!(item.input,  vec![6, 7, 8]);
+        assert_eq!(item.target, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn get_out_of_bounds_returns_none() {
+        let ds = make_dataset(10, 3);
+        assert!(ds.get(ds.len()).is_none());
+        assert!(ds.get(100).is_none());
+    }
+}

@@ -46,7 +46,9 @@ Decoder-only Transformer (nanoGPT style) implemented with [Burn 0.20](https://bu
 5. `datasets.rs` — `Dataset` enum (Shakespeare, WikiText103); `ensure_downloaded` fetches and preprocesses on first use, caches to `data/<name>/input.txt`
 6. `presets.rs` — `ModelPreset` enum (nano, gpt2-small/medium/large/xl); `config()` returns a `GPTConfig` with all architectural parameters pre-filled
 
-**Artifacts** written to `artifacts/` (gitignored): `config.json`, `model_final.mpk`, per-epoch checkpoints, metric CSVs, `experiment.log`.
+**Metrics:** Tracks loss, accuracy, and perplexity (exp(loss)) for both train and validation. Perplexity is the standard LM evaluation metric — lower is better. `MetricCheckpointingStrategy` saves only the best checkpoint by validation perplexity.
+
+**Artifacts** written to `artifacts/` (gitignored): `config.json`, `model_final.mpk`, best-epoch checkpoint, metric CSVs, `experiment.log`.
 
 ## Burn 0.20 API
 
@@ -61,6 +63,7 @@ Keep these in mind when modifying training or model code:
 - **`GradientClippingConfig`**: at `burn::grad_clipping::GradientClippingConfig`, not `burn::optim`
 - **Weight tying**: `Embedding` exposes `weight: Param<Tensor<B, 2>>` as a public field; call `.val()` to get the tensor — this is Burn's standard pattern and participates in autograd correctly
 - **Backend feature flags**: `--features cuda` selects CUDA backend; default is `wgpu` (Metal on macOS)
+- **`PerplexityMetric`**: Burn internally converts metric outputs to `NdArray` backend — omit the type parameter on `PerplexityMetric::new()` in `.metric_train_numeric()`/`.metric_valid_numeric()` and let inference resolve it. For `MetricCheckpointingStrategy::new()`, use `PerplexityMetric::<B>::new()` since there's no context to infer from.
 
 ## Known gaps vs nanoGPT
 

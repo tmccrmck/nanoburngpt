@@ -92,3 +92,64 @@ impl FromStr for ModelPreset {
         Self::from_str(s)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_str_all_variants() {
+        assert!(matches!(ModelPreset::from_str("nano").unwrap(),        ModelPreset::Nano));
+        assert!(matches!(ModelPreset::from_str("gpt2-small").unwrap(),  ModelPreset::Gpt2Small));
+        assert!(matches!(ModelPreset::from_str("gpt2-medium").unwrap(), ModelPreset::Gpt2Medium));
+        assert!(matches!(ModelPreset::from_str("gpt2-large").unwrap(),  ModelPreset::Gpt2Large));
+        assert!(matches!(ModelPreset::from_str("gpt2-xl").unwrap(),     ModelPreset::Gpt2Xl));
+    }
+
+    #[test]
+    fn from_str_unknown_errors() {
+        assert!(ModelPreset::from_str("gpt3").is_err());
+        assert!(ModelPreset::from_str("").is_err());
+    }
+
+    #[test]
+    fn nano_config_values() {
+        let c = ModelPreset::Nano.config();
+        assert_eq!(c.n_layer, 2);
+        assert_eq!(c.n_head, 4);
+        assert_eq!(c.n_embd, 64);
+        assert_eq!(c.block_size, 32);
+        assert_eq!(c.vocab_size, 50257);
+    }
+
+    #[test]
+    fn gpt2_small_config_values() {
+        let c = ModelPreset::Gpt2Small.config();
+        assert_eq!(c.n_layer, 12);
+        assert_eq!(c.n_head, 12);
+        assert_eq!(c.n_embd, 768);
+        assert_eq!(c.block_size, 1024);
+    }
+
+    #[test]
+    fn head_dim_divides_evenly_for_all_presets() {
+        for preset in [
+            ModelPreset::Nano,
+            ModelPreset::Gpt2Small,
+            ModelPreset::Gpt2Medium,
+            ModelPreset::Gpt2Large,
+            ModelPreset::Gpt2Xl,
+        ] {
+            let c = preset.config();
+            assert_eq!(
+                c.n_embd % c.n_head, 0,
+                "{} n_embd={} n_head={} — not evenly divisible",
+                c.n_embd, c.n_head, c.n_embd
+            );
+        }
+    }
+}

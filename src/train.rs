@@ -14,7 +14,9 @@ use burn::{
     record::CompactRecorder,
     tensor::backend::{AutodiffBackend, Backend},
     train::{
-        metric::{AccuracyMetric, LossMetric},
+        checkpoint::MetricCheckpointingStrategy,
+        metric::{AccuracyMetric, LossMetric, PerplexityMetric},
+        metric::store::{Aggregate, Direction, Split},
         ClassificationOutput, InferenceStep, Learner, SupervisedTraining, TrainOutput, TrainStep,
     },
 };
@@ -230,12 +232,22 @@ pub fn run_training<B: AutodiffBackend>(
     let model = GPT::new(&gpt_config, &device);
     let learner = Learner::new(model, optim, lr_scheduler);
 
+    let strategy = MetricCheckpointingStrategy::new(
+        &PerplexityMetric::<B>::new(),
+        Aggregate::Mean,
+        Direction::Lowest,
+        Split::Valid,
+    );
+
     let result = SupervisedTraining::new("artifacts", dataloader_train, dataloader_val)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
         .metric_train_numeric(AccuracyMetric::new())
         .metric_valid_numeric(AccuracyMetric::new())
+        .metric_train_numeric(PerplexityMetric::new())
+        .metric_valid_numeric(PerplexityMetric::new())
         .with_file_checkpointer(CompactRecorder::new())
+        .with_checkpointing_strategy(strategy)
         .num_epochs(training_config.num_epochs)
         .summary()
         .launch(learner);
@@ -246,4 +258,65 @@ pub fn run_training<B: AutodiffBackend>(
         .expect("Failed to save final model");
     println!("Model saved to artifacts/model_final");
 
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scheduler(max_lr: f64, min_lr: f64, warmup: usize, total: usize) -> WarmupCosineScheduler {
+        WarmupCosineScheduler::new(max_lr, min_lr, warmup, total)
+    }
+
+    fn steps(s: &mut WarmupCosineScheduler, n: usize) -> Vec<f64> {
+        (0..n).map(|_| s.step()).collect()
+    }
+
+    #[test]
+    fn warmup_ramps_linearly() {
+        let mut s = scheduler(1.0, 0.1, 4, 10);
+        let lrs = steps(&mut s, 4);
+        // iter 0 → 1/4, iter 1 → 2/4, iter 2 → 3/4, iter 3 → 4/4
+        assert!((lrs[0] - 0.25).abs() < 1e-10);
+        assert!((lrs[1] - 0.50).abs() < 1e-10);
+        assert!((lrs[2] - 0.75).abs() < 1e-10);
+        assert!((lrs[3] - 1.00).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cosine_decay_midpoint() {
+        // After warmup the cosine schedule at exactly halfway through the
+        // decay window should give (max_lr + min_lr) / 2.
+        let max_lr = 1.0_f64;
+        let min_lr = 0.1_f64;
+        let warmup = 0;
+        let total = 100;
+        let mid = total / 2;
+        let mut s = scheduler(max_lr, min_lr, warmup, total);
+        let lrs = steps(&mut s, mid + 1);
+        let expected = (max_lr + min_lr) / 2.0;
+        assert!((lrs[mid] - expected).abs() < 1e-10, "got {}", lrs[mid]);
+    }
+
+    #[test]
+    fn holds_min_lr_after_total_iters() {
+        let mut s = scheduler(1.0, 0.1, 0, 5);
+        // Advance past total
+        let lrs = steps(&mut s, 10);
+        for lr in &lrs[5..] {
+            assert!((*lr - 0.1).abs() < 1e-10, "expected min_lr, got {lr}");
+        }
+    }
+
+    #[test]
+    fn no_warmup_starts_at_cosine_start() {
+        // warmup_iters = 0: first step should be the cosine value at progress=0 → max_lr
+        let mut s = scheduler(1.0, 0.1, 0, 10);
+        let lr = s.step();
+        assert!((lr - 1.0).abs() < 1e-10, "got {lr}");
+    }
 }

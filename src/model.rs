@@ -47,14 +47,14 @@ impl<B: Backend> CausalSelfAttention<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>, mask: Tensor<B, 4>) -> Tensor<B, 3> {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
 
         // Q, K, V
         let qkv = self.c_attn.forward(x.clone());
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.n_head, head_dim]);
-        
+
         let qkv = qkv.permute([2, 0, 3, 1, 4]);
         // Use reshape instead of squeeze to avoid ambiguity when batch or seq_len == 1
         let q = qkv.clone().slice([0..1]).reshape([batch_size, self.n_head, seq_len, head_dim]);
@@ -65,20 +65,16 @@ impl<B: Backend> CausalSelfAttention<B> {
         let scale = (head_dim as f64).powf(-0.5);
         let mut att = q.matmul(k.swap_dims(2, 3)) * scale;
 
-        // Causal mask
-        let mask = Tensor::<B, 2>::ones([seq_len, seq_len], &x.device())
-            .tril(0)
-            .reshape([1, 1, seq_len, seq_len]);
-        
+        // Apply causal mask (passed in from GPT::forward, shared across layers)
         att = att.mask_fill(mask.equal_elem(0), f32::NEG_INFINITY);
         att = activation::softmax(att, 3);
         att = self.attn_dropout.forward(att);
 
         let y = att.matmul(v);
-        
+
         let y = y.permute([0, 2, 1, 3])
             .reshape([batch_size, seq_len, self.n_embd]);
-            
+
         let y = self.c_proj.forward(y);
         self.resid_dropout.forward(y)
     }
@@ -131,8 +127,8 @@ impl<B: Backend> Block<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()));
+    pub fn forward(&self, x: Tensor<B, 3>, mask: Tensor<B, 4>) -> Tensor<B, 3> {
+        let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()), mask);
         let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
         x
     }
@@ -145,6 +141,9 @@ pub struct GPT<B: Backend> {
     blocks: Vec<Block<B>>,
     ln_f: LayerNorm<B>,
     // lm_head is weight-tied to token_embedding — no separate parameter
+    // Full causal mask [1, 1, block_size, block_size] — created once, sliced in forward.
+    // Stored as a raw Tensor (not Param) so it's not a learnable parameter.
+    causal_mask: Tensor<B, 4>,
 }
 
 impl<B: Backend> GPT<B> {
@@ -158,11 +157,18 @@ impl<B: Backend> GPT<B> {
 
         let ln_f = LayerNormConfig::new(config.n_embd).init(device);
 
+        // Pre-compute the full causal mask once (lower-triangular ones).
+        let bs = config.block_size;
+        let causal_mask = Tensor::<B, 2>::ones([bs, bs], device)
+            .tril(0)
+            .reshape([1, 1, bs, bs]);
+
         Self {
             token_embedding,
             position_embedding,
             blocks,
             ln_f,
+            causal_mask,
         }
     }
 
@@ -171,14 +177,17 @@ impl<B: Backend> GPT<B> {
         let device = idx.device();
 
         let pos = Tensor::arange(0..seq_len as i64, &device).unsqueeze::<2>();
-        
+
         let tok_emb = self.token_embedding.forward(idx);
         let pos_emb = self.position_embedding.forward(pos);
-        
+
         let mut x = tok_emb + pos_emb;
-        
+
+        // Slice the pre-computed causal mask to the current sequence length
+        let mask = self.causal_mask.clone().slice([0..1, 0..1, 0..seq_len, 0..seq_len]);
+
         for block in &self.blocks {
-            x = block.forward(x);
+            x = block.forward(x, mask.clone());
         }
         
         let x = self.ln_f.forward(x);

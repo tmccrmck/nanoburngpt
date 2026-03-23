@@ -135,7 +135,7 @@ y = att @ V                                      # weighted values
 y = Linear(y, n_embd)                            # output projection
 ```
 
-The causal mask is a lower-triangular matrix recomputed each forward pass (no cache).
+The causal mask is a lower-triangular matrix created once per forward pass in `GPT::forward` and shared across all layers (not recreated per layer).
 
 **Heads:** each of `n_head` heads operates on a `head_dim = n_embd / n_head` subspace independently. Results are concatenated before the output projection.
 

@@ -3909,8 +3909,6 @@ dependencies = [
  "clap",
  "rand 0.10.0",
  "reqwest 0.13.2",
- "serde",
- "serde_json",
  "tiktoken-rs",
  "zip 2.4.2",
 ]

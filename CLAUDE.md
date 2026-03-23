@@ -10,12 +10,19 @@ cargo build --release
 
 # Smoke test (~30s, verifies full pipeline)
 cargo run -- train \
-  --num-epochs 1 --n-layer 2 --n-head 4 --n-embd 64 \
-  --block-size 32 --batch-size 16 --max-train-items 2000
+  --dataset shakespeare --model nano \
+  --batch-size 16 --max-train-items 2000 --num-epochs 1
 cargo run -- generate --max-tokens 100
 
-# Full training
-cargo run --release -- train
+# Full training (Shakespeare, nano)
+cargo run --release -- train --dataset shakespeare --model nano
+
+# Full training (Shakespeare, GPT-2 small)
+cargo run --release -- train --dataset shakespeare --model gpt2-small
+
+# Cloud GPU training (CUDA backend)
+cargo run --release --features cuda -- train \
+  --dataset wikitext103 --model gpt2-small
 
 # Generate text
 cargo run --release -- generate --prompt "HAMLET:" --temperature 0.8
@@ -32,12 +39,14 @@ There are no automated tests. Verification is done by running the smoke test abo
 Decoder-only Transformer (nanoGPT style) implemented with [Burn 0.20](https://burn.dev/) and the `wgpu` (Metal) backend.
 
 **Data flow:**
-1. `data.rs` — `load_shakespeare` downloads/reads text, builds a `CharTokenizer` (char↔index), splits into `TextDataset` (train/val), and `TextGenerationBatcher` collates samples into `TextGenerationBatch` (inputs/targets shifted by 1)
-2. `model.rs` — `GPT::forward` runs token+position embeddings → N × `Block` (LayerNorm → `CausalSelfAttention` → LayerNorm → `MLP`) → final LayerNorm → `lm_head` Linear. `GPT::generate` auto-regressively appends tokens with temperature sampling
+1. `data.rs` — `load_text` reads a pre-downloaded text file, tokenizes with `BpeTokenizer` (tiktoken-rs r50k_base, vocab_size=50257), splits 90/10 into `TextDataset` (train/val), and `TextGenerationBatcher` collates samples into `TextGenerationBatch` (inputs/targets shifted by 1)
+2. `model.rs` — `GPT::forward` runs token+position embeddings → N × `Block` (LayerNorm → `CausalSelfAttention` → LayerNorm → `MLP`) → final LayerNorm → weight-tied output projection. `GPT::generate` auto-regressively appends tokens with temperature sampling
 3. `train.rs` — `GPT::forward_classification` flattens `[batch, seq, vocab]` → `[batch*seq, vocab]` for cross-entropy. `run_training` wires together Burn's `Learner::new` + `SupervisedTraining::new(...).launch(learner)`. `WarmupCosineScheduler` implements the nanoGPT LR schedule (Burn's `ComposedLrScheduler` combines in parallel, not sequentially, so a custom impl was required)
-4. `inference.rs` — loads `artifacts/config.json`, `artifacts/tokenizer.json`, `artifacts/model_final.mpk`, encodes prompt, calls `GPT::generate`, decodes output
+4. `inference.rs` — loads `artifacts/config.json` and `artifacts/model_final.mpk`, creates `BpeTokenizer::new()`, encodes prompt, calls `GPT::generate`, decodes output
+5. `datasets.rs` — `Dataset` enum (Shakespeare, WikiText103); `ensure_downloaded` fetches and preprocesses on first use, caches to `data/<name>/input.txt`
+6. `presets.rs` — `ModelPreset` enum (nano, gpt2-small/medium/large/xl); `config()` returns a `GPTConfig` with all architectural parameters pre-filled
 
-**Artifacts** written to `artifacts/` (gitignored): `config.json`, `tokenizer.json`, `model_final.mpk`, per-epoch checkpoints, metric CSVs, `experiment.log`.
+**Artifacts** written to `artifacts/` (gitignored): `config.json`, `model_final.mpk`, per-epoch checkpoints, metric CSVs, `experiment.log`.
 
 ## Burn 0.20 API
 
@@ -49,16 +58,13 @@ Keep these in mind when modifying training or model code:
 - **`Wgpu` backend**: `Wgpu<f32, i32>` — `AutoGraphicsApi` type param was removed.
 - **`#![recursion_limit = "512"]`** in `main.rs` is required due to deep `Sync` trait chains in `wgpu-core 26.x`.
 - **Dropout**: `Dropout::forward` is a no-op when not in autodiff mode — no explicit eval mode needed for inference.
+- **`GradientClippingConfig`**: at `burn::grad_clipping::GradientClippingConfig`, not `burn::optim`
+- **Weight tying**: `Embedding` exposes `weight: Param<Tensor<B, 2>>` as a public field; call `.val()` to get the tensor — this is Burn's standard pattern and participates in autograd correctly
+- **Backend feature flags**: `--features cuda` selects CUDA backend; default is `wgpu` (Metal on macOS)
 
 ## Known gaps vs nanoGPT
 
 - Causal mask is recomputed every forward pass instead of cached
 - Multinomial sampling pulls probabilities to CPU (`into_data()`) — fine for batch=1 inference
 - No Flash Attention (not available in Burn 0.20 wgpu)
-- Character-level tokenizer only (nanoGPT uses BPE via tiktoken)
-
-## Burn 0.20 API notes (additional)
-
-- **`GradientClippingConfig`**: at `burn::grad_clipping::GradientClippingConfig`, not `burn::optim`
-- **Weight tying**: `Embedding` exposes `weight: Param<Tensor<B, 2>>` as a public field; call `.val()` to get the tensor — this is Burn's standard pattern and participates in autograd correctly
-- **Backend feature flags**: `--features cuda` selects CUDA backend; default is `wgpu` (Metal on macOS)
+- Tokenizer: always GPT-2 BPE (r50k_base, 50257 vocab) — no char-level fallback

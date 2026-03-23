@@ -1,5 +1,6 @@
 use crate::{
-    data::{TextDataset, TextGenerationBatch, TextGenerationBatcher, load_shakespeare},
+    data::{BpeTokenizer, TextDataset, TextGenerationBatch, TextGenerationBatcher, load_text},
+    datasets::Dataset,
     model::{GPTConfig, GPT},
 };
 use burn::{
@@ -17,7 +18,6 @@ use burn::{
         ClassificationOutput, InferenceStep, Learner, SupervisedTraining, TrainOutput, TrainStep,
     },
 };
-use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Training configuration
@@ -164,12 +164,14 @@ impl<B: Backend> InferenceStep for GPT<B> {
 
 pub fn run_training<B: AutodiffBackend>(
     device: B::Device,
+    dataset: Dataset,
     mut gpt_config: GPTConfig,
     training_config: TrainingConfig,
 ) {
     // --- Data ---
-    let (train_dataset, val_dataset, tokenizer) =
-        load_shakespeare(Path::new("data/input.txt"), gpt_config.block_size).unwrap();
+    let data_path = dataset.ensure_downloaded().expect("Dataset download failed");
+    let (train_dataset, val_dataset) =
+        load_text(&data_path, gpt_config.block_size).expect("Failed to load dataset");
 
     // Optionally cap the training set for smoke tests
     let train_dataset = if training_config.max_train_items > 0 {
@@ -179,8 +181,8 @@ pub fn run_training<B: AutodiffBackend>(
         train_dataset
     };
 
-    gpt_config.vocab_size = tokenizer.vocab_size;
-    println!("Vocab size: {}", gpt_config.vocab_size);
+    gpt_config.vocab_size = BpeTokenizer::VOCAB_SIZE;
+    println!("Vocab size: {} (BPE r50k_base)", gpt_config.vocab_size);
 
     std::fs::create_dir_all("artifacts").ok();
     gpt_config.save("artifacts/config.json").expect("Config saved");
@@ -244,8 +246,4 @@ pub fn run_training<B: AutodiffBackend>(
         .expect("Failed to save final model");
     println!("Model saved to artifacts/model_final");
 
-    tokenizer
-        .save(Path::new("artifacts/tokenizer.json"))
-        .expect("Failed to save tokenizer");
-    println!("Tokenizer saved to artifacts/tokenizer.json");
 }

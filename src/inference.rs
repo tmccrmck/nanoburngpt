@@ -1,4 +1,4 @@
-use crate::data::{CharTokenizer, load_shakespeare};
+use crate::data::BpeTokenizer;
 use crate::model::{GPTConfig, GPTRecord, GPT};
 use burn::{
     config::Config,
@@ -6,7 +6,6 @@ use burn::{
     record::{CompactRecorder, Recorder},
     tensor::{backend::Backend, Int, Tensor},
 };
-use std::path::Path;
 
 pub fn generate_text<B: Backend>(
     device: B::Device,
@@ -19,15 +18,8 @@ pub fn generate_text<B: Backend>(
     let config_path = format!("{}/config.json", artifact_dir);
     let config = GPTConfig::load(&config_path).expect("Config should exist");
 
-    // 2. Load Tokenizer (saved during training, fallback to rebuilding from data)
-    let tokenizer_path = format!("{}/tokenizer.json", artifact_dir);
-    let tokenizer = CharTokenizer::load(Path::new(&tokenizer_path))
-        .unwrap_or_else(|_| {
-            println!("Tokenizer not found at {tokenizer_path}, rebuilding from data...");
-            let (_, _, t) = load_shakespeare(Path::new("data/input.txt"), config.block_size)
-                .expect("Failed to load data for tokenizer");
-            t
-        });
+    // 2. Tokenizer — BPE vocab is fixed, no artifact needed
+    let tokenizer = BpeTokenizer::new();
 
     // 3. Load Model
     println!("Loading model from {artifact_dir}/model_final ...");

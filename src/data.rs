@@ -2,65 +2,8 @@ use burn::{
     data::{dataloader::batcher::Batcher, dataset::Dataset},
     tensor::{backend::Backend, Int, Tensor},
 };
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::Path};
+use std::path::Path;
 use tiktoken_rs::r50k_base;
-
-const DATA_URL: &str = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CharTokenizer {
-    pub char_to_idx: HashMap<char, usize>,
-    pub idx_to_char: HashMap<usize, char>,
-    pub vocab_size: usize,
-}
-
-impl CharTokenizer {
-    pub fn new(text: &str) -> Self {
-        let mut chars: Vec<char> = text.chars().collect();
-        chars.sort();
-        chars.dedup();
-        
-        let vocab_size = chars.len();
-        let mut char_to_idx = HashMap::new();
-        let mut idx_to_char = HashMap::new();
-
-        for (i, c) in chars.into_iter().enumerate() {
-            char_to_idx.insert(c, i);
-            idx_to_char.insert(i, c);
-        }
-
-        Self {
-            char_to_idx,
-            idx_to_char,
-            vocab_size,
-        }
-    }
-
-    pub fn encode(&self, text: &str) -> Vec<usize> {
-        text.chars()
-            .map(|c| *self.char_to_idx.get(&c).unwrap_or(&0))
-            .collect()
-    }
-
-    pub fn decode(&self, ids: &[usize]) -> String {
-        ids.iter()
-            .map(|i| *self.idx_to_char.get(i).unwrap_or(&'?'))
-            .collect()
-    }
-
-    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let json = serde_json::to_string(self)?;
-        fs::write(path, json)?;
-        Ok(())
-    }
-
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let json = fs::read_to_string(path)?;
-        let tokenizer = serde_json::from_str(&json)?;
-        Ok(tokenizer)
-    }
-}
 
 pub struct TextDataset {
     pub data: Vec<usize>,
@@ -128,7 +71,7 @@ impl<B: Backend> Batcher<B, TextDatasetItem, TextGenerationBatch<B>> for TextGen
             .iter()
             .map(|item| Tensor::<B, 1, Int>::from_ints(item.input.as_slice(), device))
             .collect();
-            
+
         let targets = items
             .iter()
             .map(|item| Tensor::<B, 1, Int>::from_ints(item.target.as_slice(), device))
@@ -139,35 +82,6 @@ impl<B: Backend> Batcher<B, TextDatasetItem, TextGenerationBatch<B>> for TextGen
 
         TextGenerationBatch { inputs, targets }
     }
-}
-
-pub fn load_shakespeare(path: &Path, block_size: usize) -> anyhow::Result<(TextDataset, TextDataset, CharTokenizer)> {
-    let text = if path.exists() {
-        fs::read_to_string(path)?
-    } else {
-        println!("Downloading dataset from {}...", DATA_URL);
-        let text = reqwest::blocking::get(DATA_URL)?.text()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, &text)?;
-        text
-    };
-
-    let tokenizer = CharTokenizer::new(&text);
-    let data = tokenizer.encode(&text);
-
-    // Split 90% train, 10% val
-    let n = data.len();
-    let split = (n as f64 * 0.9) as usize;
-    let train_data = data[..split].to_vec();
-    let val_data = data[split..].to_vec();
-
-    Ok((
-        TextDataset::new(train_data, block_size),
-        TextDataset::new(val_data, block_size),
-        tokenizer,
-    ))
 }
 
 // ---------------------------------------------------------------------------

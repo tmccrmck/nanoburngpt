@@ -1,8 +1,0 @@
-{
-  "vocab_size": 65,
-  "n_layer": 2,
-  "n_head": 4,
-  "n_embd": 64,
-  "block_size": 32,
-  "dropout": 0.2
-}

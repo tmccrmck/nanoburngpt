@@ -3,12 +3,16 @@
 #[cfg(not(any(feature = "wgpu", feature = "cuda")))]
 compile_error!("Enable at least one backend feature: `wgpu` or `cuda`");
 
+use std::str::FromStr;
+
 use burn::backend::Autodiff;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use clap::{Parser, Subcommand};
 use nanoburngpt::{
+    datasets::Dataset,
     inference::generate_text,
     model::GPTConfig,
+    presets::ModelPreset,
     train::{run_training, TrainingConfig},
 };
 
@@ -22,18 +26,24 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Train {
-        /// Number of transformer layers
-        #[arg(long, default_value_t = 6)]
-        n_layer: usize,
-        /// Number of attention heads
-        #[arg(long, default_value_t = 6)]
-        n_head: usize,
-        /// Embedding dimension
-        #[arg(long, default_value_t = 384)]
-        n_embd: usize,
-        /// Context window size
-        #[arg(long, default_value_t = 128)]
-        block_size: usize,
+        /// Model size preset (nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl)
+        #[arg(long, default_value = "nano")]
+        model: String,
+        /// Dataset to train on (shakespeare, wikitext103)
+        #[arg(long, default_value = "shakespeare")]
+        dataset: String,
+        /// Override preset: number of transformer layers
+        #[arg(long)]
+        n_layer: Option<usize>,
+        /// Override preset: number of attention heads
+        #[arg(long)]
+        n_head: Option<usize>,
+        /// Override preset: embedding dimension
+        #[arg(long)]
+        n_embd: Option<usize>,
+        /// Override preset: context window size
+        #[arg(long)]
+        block_size: Option<usize>,
         /// Dropout probability
         #[arg(long, default_value_t = 0.2)]
         dropout: f64,
@@ -91,6 +101,8 @@ where
 {
     match cli.command {
         Commands::Train {
+            model,
+            dataset,
             n_layer,
             n_head,
             n_embd,
@@ -107,14 +119,22 @@ where
             weight_decay,
             max_train_items,
         } => {
+            let preset = ModelPreset::from_str(&model)
+                .expect("Invalid --model. Use: nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl");
+            let preset_cfg = preset.config();
+
             let gpt_config = GPTConfig {
-                vocab_size: 0, // Set from data
-                n_layer,
-                n_head,
-                n_embd,
-                block_size,
+                vocab_size: preset_cfg.vocab_size,
+                n_layer:    n_layer.unwrap_or(preset_cfg.n_layer),
+                n_head:     n_head.unwrap_or(preset_cfg.n_head),
+                n_embd:     n_embd.unwrap_or(preset_cfg.n_embd),
+                block_size: block_size.unwrap_or(preset_cfg.block_size),
                 dropout,
             };
+
+            let dataset_enum = Dataset::from_str(&dataset)
+                .expect("Invalid --dataset. Use: shakespeare, wikitext103");
+
             let training_config = TrainingConfig {
                 batch_size,
                 num_workers,
@@ -127,8 +147,14 @@ where
                 num_epochs,
                 max_train_items,
             };
-            println!("Starting training on device: {:?}", device);
-            run_training::<AB>(device, gpt_config, training_config);
+
+            println!("Model: {} ({} layers, {} heads, {} embd, ctx {})",
+                model, gpt_config.n_layer, gpt_config.n_head,
+                gpt_config.n_embd, gpt_config.block_size);
+            println!("Dataset: {}", dataset);
+            println!("Device: {:?}", device);
+
+            run_training::<AB>(device, dataset_enum, gpt_config, training_config);
         }
         Commands::Generate {
             artifact_dir,

@@ -125,17 +125,17 @@ Pre-LN (normalizing before the sublayer, not after) is more training-stable than
 
 ### CausalSelfAttention
 
-Multi-head scaled dot-product attention with a causal mask.
+Multi-head scaled dot-product attention with a causal mask, using Burn's fused SDPA kernel (`burn::tensor::module::attention`).
 
 ```
 Q, K, V = split(Linear(x, 3*n_embd))          # fused QKV projection
-att = softmax((Q @ K.T) / sqrt(head_dim))       # scaled attention scores
-att = mask_fill(att, upper_triangle, -inf)       # causal: no future tokens
-y = att @ V                                      # weighted values
-y = Linear(y, n_embd)                            # output projection
+y = attention(Q, K, V, causal_mask)            # fused scaled dot-product attention
+y = Linear(y, n_embd)                          # output projection
 ```
 
-The causal mask is a lower-triangular matrix created once per forward pass in `GPT::forward` and shared across all layers (not recreated per layer).
+The `attention()` kernel handles `softmax(QK^T / sqrt(d_k)) * V` and causal masking internally. On CUDA backends this may use an optimized kernel; on wgpu it uses a standard fused implementation. Attention dropout is not supported by this kernel (residual dropout is still applied after the output projection).
+
+**Causal mask:** a boolean tensor (`true` = masked) pre-computed once in `GPT::new` at the full `block_size × block_size` and sliced to `seq_len` in `forward`. This avoids recreating the mask on every step.
 
 **Heads:** each of `n_head` heads operates on a `head_dim = n_embd / n_head` subspace independently. Results are concatenated before the output projection.
 
@@ -198,31 +198,48 @@ Learner::new(model, AdamW, WarmupCosineScheduler)
 SupervisedTraining::new("artifacts", train_dl, val_dl)
     .metric_train_numeric(LossMetric)
     .metric_valid_numeric(LossMetric)
+    .metric_train_numeric(AccuracyMetric)
+    .metric_valid_numeric(AccuracyMetric)
+    .metric_train_numeric(PerplexityMetric)
+    .metric_valid_numeric(PerplexityMetric)
     .with_file_checkpointer(CompactRecorder)
+    .with_checkpointing_strategy(best_perplexity)
     .launch(learner)
 ```
 
-Checkpoints are saved per epoch to `artifacts/checkpoint/`. The final model is saved as `artifacts/model_final.mpk` (MessagePack via `CompactRecorder`).
+Checkpoints are saved per epoch to `artifacts/checkpoint/`. The best checkpoint is selected by lowest validation perplexity (`MetricCheckpointingStrategy`). The final model is saved as `artifacts/model_final.mpk` (MessagePack via `CompactRecorder`).
 
 ---
 
 ## Inference
 
-**File:** `src/inference.rs`
+**File:** `src/inference.rs`, `src/model.rs` (`GPT::generate`, `GPT::forward_cached`)
 
-Auto-regressive generation: repeatedly feed the current token sequence through the model, take the logits at the last position, and sample the next token.
+### KV Cache
+
+Auto-regressive generation uses a **KV cache** to avoid redundant computation. Instead of re-running the full sequence through every layer on each step, cached K and V tensors from previous steps are reused:
 
 ```
-idx = encode(prompt)
+# Prefill: process entire prompt, build initial KV cache
+logits, cache = model.forward_cached(prompt_tokens, cache=None)
+
+# Decode: one token at a time, extending the cache
 for _ in 0..max_new_tokens:
-    idx_cond = idx[-block_size:]          # crop to context window
-    logits = model(idx_cond)[:, -1, :]   # last position only
-    next = sample(softmax(logits / temp))
-    idx = cat(idx, next)
-return decode(idx)
+    next = sample(logits[:, -1, :])
+    logits, cache = model.forward_cached(next, cache=Some(cache))
 ```
 
-**Sampling:** temperature-scaled multinomial sampling. At `temperature=0`, greedy (argmax) is used instead. Probabilities are pulled to CPU (`into_data()`) for sampling since `rand::WeightedIndex` operates on CPU — acceptable overhead for batch=1 inference.
+**Cache structure:** `KVCache` holds a `Vec<(K, V)>` per layer, where K and V have shape `[batch, n_head, cached_seq, head_dim]`. Each decode step concatenates the new token's K/V with the cached tensors along the sequence dimension.
+
+**Masking:** during prefill (multi-token), the pre-computed causal mask is applied. During single-token decode steps, no mask is needed — the new token naturally attends to all cached positions plus itself.
+
+**Position tracking:** the position embedding offset is derived from the cache length (`cache.layers[0].K.dims()[2]`), so new tokens receive the correct positional encoding without re-encoding the full sequence.
+
+**Complexity:** reduces per-step cost from O(seq²) to O(seq) during generation, at the cost of O(n_layer × n_head × seq × head_dim) memory for the cache.
+
+### Sampling
+
+Temperature-scaled multinomial sampling. At `temperature=0`, greedy (argmax) is used instead. Probabilities are pulled to CPU (`into_data()`) for sampling since `rand::WeightedIndex` operates on CPU — acceptable overhead for batch=1 inference.
 
 ---
 
@@ -286,7 +303,8 @@ Inference loads `config.json` to reconstruct the architecture, then loads weight
 | nanoGPT (Python/PyTorch) | NanoBurnGPT (Rust/Burn) |
 |--------------------------|------------------------|
 | Python + PyTorch | Rust + Burn 0.20 |
-| Flash Attention | Standard attention (not available in Burn 0.20 wgpu) |
-| KV cache for inference | No cache — full forward pass each step |
+| Flash Attention (PyTorch SDPA) | Burn's fused SDPA kernel (`burn::tensor::module::attention`) |
+| KV cache for inference | KV cache (`GPT::forward_cached`, `KVCache`) |
 | `torch.compile` | Burn's own graph fusion |
 | CPU multinomial sampling | CPU multinomial via `rand::WeightedIndex` |
+| Top-k / top-p sampling | Temperature-only sampling (no nucleus sampling yet) |

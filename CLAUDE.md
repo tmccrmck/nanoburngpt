@@ -32,7 +32,10 @@ cargo check
 cargo clippy
 ```
 
-There are no automated tests. Verification is done by running the smoke test above.
+```sh
+# Unit tests (24 tests across data, datasets, presets, train, model)
+cargo test
+```
 
 ## Architecture
 
@@ -40,7 +43,7 @@ Decoder-only Transformer (nanoGPT style) implemented with [Burn 0.20](https://bu
 
 **Data flow:**
 1. `data.rs` — `load_text` reads a pre-downloaded text file, tokenizes with `BpeTokenizer` (tiktoken-rs r50k_base, vocab_size=50257), splits 90/10 into `TextDataset` (train/val), and `TextGenerationBatcher` collates samples into `TextGenerationBatch` (inputs/targets shifted by 1)
-2. `model.rs` — `GPT::forward` runs token+position embeddings → N × `Block` (LayerNorm → `CausalSelfAttention` → LayerNorm → `MLP`) → final LayerNorm → weight-tied output projection. `GPT::generate` auto-regressively appends tokens with temperature sampling
+2. `model.rs` — `GPT::forward` runs token+position embeddings → N × `Block` (LayerNorm → `CausalSelfAttention` → LayerNorm → `MLP`) → final LayerNorm → weight-tied output projection. Attention uses Burn's fused SDPA kernel (`burn::tensor::module::attention`). The causal mask is a boolean tensor pre-computed once in `GPT::new` and sliced per forward call. `GPT::generate` uses KV caching via `GPT::forward_cached` — prefills the prompt, then decodes one token at a time reusing cached K/V tensors
 3. `train.rs` — `GPT::forward_classification` flattens `[batch, seq, vocab]` → `[batch*seq, vocab]` for cross-entropy. `run_training` wires together Burn's `Learner::new` + `SupervisedTraining::new(...).launch(learner)`. `WarmupCosineScheduler` implements the nanoGPT LR schedule (Burn's `ComposedLrScheduler` combines in parallel, not sequentially, so a custom impl was required)
 4. `inference.rs` — loads `artifacts/config.json` and `artifacts/model_final.mpk`, creates `BpeTokenizer::new()`, encodes prompt, calls `GPT::generate`, decodes output
 5. `datasets.rs` — `Dataset` enum (Shakespeare, WikiText103); `ensure_downloaded` fetches and preprocesses on first use, caches to `data/<name>/input.txt`
@@ -65,9 +68,15 @@ Keep these in mind when modifying training or model code:
 - **Backend feature flags**: `--features cuda` selects CUDA backend; default is `wgpu` (Metal on macOS)
 - **`PerplexityMetric`**: Burn internally converts metric outputs to `NdArray` backend — omit the type parameter on `PerplexityMetric::new()` in `.metric_train_numeric()`/`.metric_valid_numeric()` and let inference resolve it. For `MetricCheckpointingStrategy::new()`, use `PerplexityMetric::<B>::new()` since there's no context to infer from.
 
+## Attention & inference
+
+- **Fused SDPA:** `CausalSelfAttention` uses `burn::tensor::module::attention` — a fused scaled dot-product attention kernel. On CUDA this may use an optimized kernel; on wgpu it's a standard fused implementation. Attention dropout is not supported by this kernel.
+- **Causal mask:** pre-computed as a `Tensor<B, 4, Bool>` (`true` = masked) in `GPT::new` at full `block_size × block_size`. Sliced to `seq_len` in `forward`. Stored as a non-parameter field on the module.
+- **KV cache:** `GPT::forward_cached` accepts an optional `KVCache` (vec of per-layer K/V tensors). On prefill (cache=None) the full sequence is processed with the causal mask. On decode (cache=Some) a single token is processed and its K/V are concatenated with the cache. Position offset is derived from cache length. `GPT::generate` uses this for O(seq) per-step decoding.
+- **`GPT::forward`** (used for training) is unchanged — no cache, full causal mask every call.
+
 ## Known gaps vs nanoGPT
 
-- Causal mask is recomputed every forward pass instead of cached
 - Multinomial sampling pulls probabilities to CPU (`into_data()`) — fine for batch=1 inference
-- No Flash Attention (not available in Burn 0.20 wgpu)
+- No top-k / top-p (nucleus) sampling — only temperature scaling
 - Tokenizer: always GPT-2 BPE (r50k_base, 50257 vocab) — no char-level fallback

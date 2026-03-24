@@ -13,11 +13,11 @@ pub enum ModelPreset {
 impl ModelPreset {
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
         match s {
-            "nano"        => Ok(Self::Nano),
-            "gpt2-small"  => Ok(Self::Gpt2Small),
+            "nano" => Ok(Self::Nano),
+            "gpt2-small" => Ok(Self::Gpt2Small),
             "gpt2-medium" => Ok(Self::Gpt2Medium),
-            "gpt2-large"  => Ok(Self::Gpt2Large),
-            "gpt2-xl"     => Ok(Self::Gpt2Xl),
+            "gpt2-large" => Ok(Self::Gpt2Large),
+            "gpt2-xl" => Ok(Self::Gpt2Xl),
             other => anyhow::bail!(
                 "Unknown model preset '{}'. Available: nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl",
                 other
@@ -103,11 +103,26 @@ mod tests {
 
     #[test]
     fn from_str_all_variants() {
-        assert!(matches!(ModelPreset::from_str("nano").unwrap(),        ModelPreset::Nano));
-        assert!(matches!(ModelPreset::from_str("gpt2-small").unwrap(),  ModelPreset::Gpt2Small));
-        assert!(matches!(ModelPreset::from_str("gpt2-medium").unwrap(), ModelPreset::Gpt2Medium));
-        assert!(matches!(ModelPreset::from_str("gpt2-large").unwrap(),  ModelPreset::Gpt2Large));
-        assert!(matches!(ModelPreset::from_str("gpt2-xl").unwrap(),     ModelPreset::Gpt2Xl));
+        assert!(matches!(
+            ModelPreset::from_str("nano").unwrap(),
+            ModelPreset::Nano
+        ));
+        assert!(matches!(
+            ModelPreset::from_str("gpt2-small").unwrap(),
+            ModelPreset::Gpt2Small
+        ));
+        assert!(matches!(
+            ModelPreset::from_str("gpt2-medium").unwrap(),
+            ModelPreset::Gpt2Medium
+        ));
+        assert!(matches!(
+            ModelPreset::from_str("gpt2-large").unwrap(),
+            ModelPreset::Gpt2Large
+        ));
+        assert!(matches!(
+            ModelPreset::from_str("gpt2-xl").unwrap(),
+            ModelPreset::Gpt2Xl
+        ));
     }
 
     #[test]
@@ -146,9 +161,12 @@ mod tests {
         ] {
             let c = preset.config();
             assert_eq!(
-                c.n_embd % c.n_head, 0,
+                c.n_embd % c.n_head,
+                0,
                 "{} n_embd={} n_head={} — not evenly divisible",
-                c.n_embd, c.n_head, c.n_embd
+                c.n_embd,
+                c.n_head,
+                c.n_embd
             );
         }
     }

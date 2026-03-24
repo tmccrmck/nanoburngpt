@@ -1,11 +1,12 @@
 use crate::data::BpeTokenizer;
-use crate::model::{GPTConfig, GPTRecord, SamplingParams, GPT};
+use crate::model::{GPT, GPTConfig, GPTRecord, SamplingParams};
 use burn::{
     config::Config,
     module::Module,
     record::{CompactRecorder, Recorder},
-    tensor::{backend::Backend, Int, Tensor},
+    tensor::{Int, Tensor, backend::Backend},
 };
+use std::io::{self, Write};
 
 pub fn generate_text<B: Backend>(
     device: B::Device,
@@ -31,25 +32,23 @@ pub fn generate_text<B: Backend>(
 
     // 4. Encode Prompt
     let tokens = tokenizer.encode(prompt);
-    let token_tensor =
-        Tensor::<B, 1, Int>::from_ints(tokens.as_slice(), &device).unsqueeze::<2>();
+    let token_tensor = Tensor::<B, 1, Int>::from_ints(tokens.as_slice(), &device).unsqueeze::<2>();
 
-    // 5. Generate
-    println!("Generating...\n");
-    let generated = model.generate(token_tensor, max_tokens, sampling, config.block_size);
+    // 5. Generate with streaming output
+    print!("{prompt}");
+    io::stdout().flush().ok();
 
-    // 6. Decode
-    let data = generated.squeeze::<1>().into_data();
-    let generated_tokens: Vec<usize> = data
-        .as_slice::<i32>()
-        .expect("i32 tensor data")
-        .iter()
-        .map(|&x| x as usize)
-        .collect();
-
-    let text = tokenizer.decode(&generated_tokens);
-    println!(
-        "Generated Text:\n----------------------------------------\n{}\n----------------------------------------",
-        text
+    model.generate(
+        token_tensor,
+        max_tokens,
+        sampling,
+        config.block_size,
+        |token_id| {
+            let text = tokenizer.decode(&[token_id as usize]);
+            print!("{text}");
+            io::stdout().flush().ok();
+        },
     );
+
+    println!();
 }

@@ -13,7 +13,7 @@ use nanoburngpt::{
     inference::generate_text,
     model::GPTConfig,
     presets::ModelPreset,
-    train::{run_training, TrainingConfig},
+    train::{TrainingConfig, run_training},
 };
 
 #[derive(Parser)]
@@ -131,9 +131,9 @@ where
 
             let gpt_config = GPTConfig {
                 vocab_size: preset_cfg.vocab_size,
-                n_layer:    n_layer.unwrap_or(preset_cfg.n_layer),
-                n_head:     n_head.unwrap_or(preset_cfg.n_head),
-                n_embd:     n_embd.unwrap_or(preset_cfg.n_embd),
+                n_layer: n_layer.unwrap_or(preset_cfg.n_layer),
+                n_head: n_head.unwrap_or(preset_cfg.n_head),
+                n_embd: n_embd.unwrap_or(preset_cfg.n_embd),
                 block_size: block_size.unwrap_or(preset_cfg.block_size),
                 dropout,
             };
@@ -154,9 +154,14 @@ where
                 max_train_items,
             };
 
-            println!("Model: {} ({} layers, {} heads, {} embd, ctx {})",
-                model, gpt_config.n_layer, gpt_config.n_head,
-                gpt_config.n_embd, gpt_config.block_size);
+            println!(
+                "Model: {} ({} layers, {} heads, {} embd, ctx {})",
+                model,
+                gpt_config.n_layer,
+                gpt_config.n_head,
+                gpt_config.n_embd,
+                gpt_config.block_size
+            );
             println!("Dataset: {}", dataset);
             println!("Device: {:?}", device);
 

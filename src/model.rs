@@ -1,3 +1,4 @@
+use burn::tensor::module::attention;
 use burn::{
     config::Config,
     module::Module,
@@ -5,9 +6,8 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, LayerNorm,
         LayerNormConfig, Linear, LinearConfig,
     },
-    tensor::{backend::Backend, activation, Bool, Int, Tensor},
+    tensor::{Bool, Int, Tensor, activation, backend::Backend},
 };
-use burn::tensor::module::attention;
 use rand::distr::{Distribution, weighted::WeightedIndex};
 
 // ---------------------------------------------------------------------------
@@ -27,7 +27,11 @@ pub struct SamplingParams {
 
 impl Default for SamplingParams {
     fn default() -> Self {
-        Self { temperature: 0.8, top_k: 0, top_p: 1.0 }
+        Self {
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+        }
     }
 }
 
@@ -57,8 +61,7 @@ fn sample_token<B: Backend>(
             })
             .collect();
 
-        Tensor::<B, 1, Int>::from_ints(tokens.as_slice(), device)
-            .unsqueeze::<2>()
+        Tensor::<B, 1, Int>::from_ints(tokens.as_slice(), device).unsqueeze::<2>()
     }
 }
 
@@ -143,10 +146,16 @@ impl<B: Backend> CausalSelfAttention<B> {
         let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
         Self {
             c_attn: LinearConfig::new(config.n_embd, 3 * config.n_embd)
-                .with_initializer(Initializer::Normal { mean: 0.0, std: 0.02 })
+                .with_initializer(Initializer::Normal {
+                    mean: 0.0,
+                    std: 0.02,
+                })
                 .init(device),
             c_proj: LinearConfig::new(config.n_embd, config.n_embd)
-                .with_initializer(Initializer::Normal { mean: 0.0, std: proj_std })
+                .with_initializer(Initializer::Normal {
+                    mean: 0.0,
+                    std: proj_std,
+                })
                 .init(device),
             resid_dropout: DropoutConfig::new(config.dropout).init(),
             n_head: config.n_head,
@@ -164,16 +173,26 @@ impl<B: Backend> CausalSelfAttention<B> {
 
         let qkv = qkv.permute([2, 0, 3, 1, 4]);
         // Use reshape instead of squeeze to avoid ambiguity when batch or seq_len == 1
-        let q = qkv.clone().slice([0..1]).reshape([batch_size, self.n_head, seq_len, head_dim]);
-        let k = qkv.clone().slice([1..2]).reshape([batch_size, self.n_head, seq_len, head_dim]);
-        let v = qkv.clone().slice([2..3]).reshape([batch_size, self.n_head, seq_len, head_dim]);
+        let q = qkv
+            .clone()
+            .slice([0..1])
+            .reshape([batch_size, self.n_head, seq_len, head_dim]);
+        let k = qkv
+            .clone()
+            .slice([1..2])
+            .reshape([batch_size, self.n_head, seq_len, head_dim]);
+        let v = qkv
+            .clone()
+            .slice([2..3])
+            .reshape([batch_size, self.n_head, seq_len, head_dim]);
 
         // Burn's fused SDPA kernel: computes softmax(QK^T / sqrt(d_k)) * V.
         // May use an optimized kernel on CUDA; standard implementation on wgpu.
         // Does not support attention dropout (resid_dropout still applied after).
         let y = attention(q, k, v, mask);
 
-        let y = y.permute([0, 2, 1, 3])
+        let y = y
+            .permute([0, 2, 1, 3])
             .reshape([batch_size, seq_len, self.n_embd]);
 
         let y = self.c_proj.forward(y);
@@ -196,9 +215,18 @@ impl<B: Backend> CausalSelfAttention<B> {
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.n_head, head_dim]);
         let qkv = qkv.permute([2, 0, 3, 1, 4]);
 
-        let q = qkv.clone().slice([0..1]).reshape([batch_size, self.n_head, seq_len, head_dim]);
-        let mut k = qkv.clone().slice([1..2]).reshape([batch_size, self.n_head, seq_len, head_dim]);
-        let mut v = qkv.clone().slice([2..3]).reshape([batch_size, self.n_head, seq_len, head_dim]);
+        let q = qkv
+            .clone()
+            .slice([0..1])
+            .reshape([batch_size, self.n_head, seq_len, head_dim]);
+        let mut k = qkv
+            .clone()
+            .slice([1..2])
+            .reshape([batch_size, self.n_head, seq_len, head_dim]);
+        let mut v = qkv
+            .clone()
+            .slice([2..3])
+            .reshape([batch_size, self.n_head, seq_len, head_dim]);
 
         // Concatenate with cached K, V from previous steps
         if let Some((cached_k, cached_v)) = cache {
@@ -210,7 +238,8 @@ impl<B: Backend> CausalSelfAttention<B> {
 
         let y = attention(q, k, v, mask);
 
-        let y = y.permute([0, 2, 1, 3])
+        let y = y
+            .permute([0, 2, 1, 3])
             .reshape([batch_size, seq_len, self.n_embd]);
 
         let y = self.c_proj.forward(y);
@@ -230,10 +259,16 @@ impl<B: Backend> MLP<B> {
         let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
         Self {
             c_fc: LinearConfig::new(config.n_embd, 4 * config.n_embd)
-                .with_initializer(Initializer::Normal { mean: 0.0, std: 0.02 })
+                .with_initializer(Initializer::Normal {
+                    mean: 0.0,
+                    std: 0.02,
+                })
                 .init(device),
             c_proj: LinearConfig::new(4 * config.n_embd, config.n_embd)
-                .with_initializer(Initializer::Normal { mean: 0.0, std: proj_std })
+                .with_initializer(Initializer::Normal {
+                    mean: 0.0,
+                    std: proj_std,
+                })
                 .init(device),
             dropout: DropoutConfig::new(config.dropout).init(),
         }
@@ -277,7 +312,9 @@ impl<B: Backend> Block<B> {
         cache: Option<LayerKV<B>>,
         mask: Option<Tensor<B, 4, Bool>>,
     ) -> (Tensor<B, 3>, LayerKV<B>) {
-        let (attn_out, new_cache) = self.attn.forward_cached(self.ln_1.forward(x.clone()), cache, mask);
+        let (attn_out, new_cache) =
+            self.attn
+                .forward_cached(self.ln_1.forward(x.clone()), cache, mask);
         let x = x + attn_out;
         let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
         (x, new_cache)
@@ -299,7 +336,8 @@ pub struct GPT<B: Backend> {
 impl<B: Backend> GPT<B> {
     pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
         let token_embedding = EmbeddingConfig::new(config.vocab_size, config.n_embd).init(device);
-        let position_embedding = EmbeddingConfig::new(config.block_size, config.n_embd).init(device);
+        let position_embedding =
+            EmbeddingConfig::new(config.block_size, config.n_embd).init(device);
 
         let blocks = (0..config.n_layer)
             .map(|_| Block::new(config, device))
@@ -335,12 +373,15 @@ impl<B: Backend> GPT<B> {
         let mut x = tok_emb + pos_emb;
 
         // Slice the pre-computed causal mask to the current sequence length
-        let mask = self.causal_mask.clone().slice([0..1, 0..1, 0..seq_len, 0..seq_len]);
+        let mask = self
+            .causal_mask
+            .clone()
+            .slice([0..1, 0..1, 0..seq_len, 0..seq_len]);
 
         for block in &self.blocks {
             x = block.forward(x, Some(mask.clone()));
         }
-        
+
         let x = self.ln_f.forward(x);
 
         // Weight-tied output projection: x @ token_embedding.weight.T
@@ -374,7 +415,11 @@ impl<B: Backend> GPT<B> {
         // Causal mask only needed during prefill (multi-token); single-token decode
         // needs no mask since it attends to all cached positions + itself.
         let mask = if cache.is_none() && seq_len > 1 {
-            Some(self.causal_mask.clone().slice([0..1, 0..1, 0..seq_len, 0..seq_len]))
+            Some(
+                self.causal_mask
+                    .clone()
+                    .slice([0..1, 0..1, 0..seq_len, 0..seq_len]),
+            )
         } else {
             None
         };
@@ -391,19 +436,24 @@ impl<B: Backend> GPT<B> {
 
         let weight = self.token_embedding.weight.val();
         let [vocab_size, n_embd] = weight.dims();
-        let logits = x.reshape([batch * seq_len, n_embd])
+        let logits = x
+            .reshape([batch * seq_len, n_embd])
             .matmul(weight.transpose())
             .reshape([batch, seq_len, vocab_size]);
 
         (logits, KVCache { layers: new_layers })
     }
 
+    /// Auto-regressive generation with KV cache.
+    /// Calls `on_token(token_id)` for each newly generated token, enabling
+    /// streaming output. The callback receives the raw token ID (as i32).
     pub fn generate(
         &self,
         idx: Tensor<B, 2, Int>,
         max_new_tokens: usize,
         sampling: &SamplingParams,
         block_size: usize,
+        mut on_token: impl FnMut(i32),
     ) -> Tensor<B, 2, Int> {
         let mut rng = rand::rng();
         let [batch, _] = idx.dims();
@@ -416,15 +466,19 @@ impl<B: Backend> GPT<B> {
 
         for _ in 0..max_new_tokens {
             let [_, len, vocab] = next_logits.dims();
-            // Take logits of the last position: [batch, vocab]
             let logits = next_logits
                 .slice([0..batch, len - 1..len, 0..vocab])
                 .reshape([batch, vocab]);
 
             let idx_next = sample_token::<B>(&logits, sampling, batch, vocab, &device, &mut rng);
+
+            // Stream the token to the caller
+            let token_data = idx_next.clone().into_data();
+            let token_id = token_data.as_slice::<i32>().expect("i32")[0];
+            on_token(token_id);
+
             all_tokens = Tensor::cat(vec![all_tokens, idx_next.clone()], 1);
 
-            // Check if we've hit the context window limit
             let [_, total_len] = all_tokens.dims();
             if total_len >= block_size {
                 break;
@@ -490,22 +544,26 @@ mod tests {
         // 1. Full forward pass
         let full_logits = gpt.forward(prompt.clone());
         // Last token's logits
-        let expected_logits = full_logits.slice([0..1, prompt_len-1..prompt_len]);
+        let expected_logits = full_logits.slice([0..1, prompt_len - 1..prompt_len]);
 
         // 2. Incremental KV cache pass
         // Process first 4 tokens to warm up cache
-        let context = prompt.clone().slice([0..1, 0..prompt_len-1]); // [0, 1, 2, 3]
+        let context = prompt.clone().slice([0..1, 0..prompt_len - 1]); // [0, 1, 2, 3]
         let (_, cache) = gpt.forward_cached(context, None);
 
         // Process 5th token (index 4) using cache
-        let last_token = prompt.clone().slice([0..1, prompt_len-1..prompt_len]); // [4]
+        let last_token = prompt.clone().slice([0..1, prompt_len - 1..prompt_len]); // [4]
         let (cached_logits, _) = gpt.forward_cached(last_token, Some(cache));
 
         // Compare logits
         let diff = (expected_logits - cached_logits).abs().sum();
         let diff_val = diff.into_scalar();
-        
-        assert!(diff_val < 1e-5, "KV cache logits differ from full forward pass: {}", diff_val);
+
+        assert!(
+            diff_val < 1e-5,
+            "KV cache logits differ from full forward pass: {}",
+            diff_val
+        );
     }
 
     #[test]
@@ -545,9 +603,9 @@ mod tests {
         let probs = vec![0.15, 0.5, 0.05, 0.3];
         let result = filter_top_k_p(&probs, 3, 0.6);
         assert_eq!(result[0], 0.0); // 0.15 excluded by top_p
-        assert!(result[1] > 0.0);   // 0.5 kept
+        assert!(result[1] > 0.0); // 0.5 kept
         assert_eq!(result[2], 0.0); // 0.05 excluded by top_k
-        assert!(result[3] > 0.0);   // 0.3 kept
+        assert!(result[3] > 0.0); // 0.3 kept
         let sum: f32 = result.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
     }

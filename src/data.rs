@@ -1,6 +1,6 @@
 use burn::{
     data::{dataloader::batcher::Batcher, dataset::Dataset},
-    tensor::{backend::Backend, Int, Tensor},
+    tensor::{Int, Tensor, backend::Backend},
 };
 use std::path::Path;
 use tiktoken_rs::r50k_base;
@@ -55,7 +55,10 @@ pub struct TextGenerationBatcher<B: Backend> {
 
 impl<B: Backend> TextGenerationBatcher<B> {
     pub fn new(block_size: usize) -> Self {
-        Self { block_size, _b: std::marker::PhantomData }
+        Self {
+            block_size,
+            _b: std::marker::PhantomData,
+        }
     }
 }
 
@@ -100,7 +103,11 @@ impl BpeTokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Vec<usize> {
-        self.bpe.encode_ordinary(text).into_iter().map(|t| t as usize).collect()
+        self.bpe
+            .encode_ordinary(text)
+            .into_iter()
+            .map(|t| t as usize)
+            .collect()
     }
 
     pub fn decode(&self, tokens: &[usize]) -> String {
@@ -162,7 +169,7 @@ mod tests {
         let ds = make_dataset(10, 4);
         let item = ds.get(0).expect("should exist");
         // tokens 0..4 → input, tokens 1..5 → target
-        assert_eq!(item.input,  vec![0, 1, 2, 3]);
+        assert_eq!(item.input, vec![0, 1, 2, 3]);
         assert_eq!(item.target, vec![1, 2, 3, 4]);
     }
 
@@ -173,7 +180,7 @@ mod tests {
         let ds = make_dataset(n, block_size);
         let last = ds.len() - 1; // index 6: tokens [6,7,8] / [7,8,9]
         let item = ds.get(last).expect("should exist");
-        assert_eq!(item.input,  vec![6, 7, 8]);
+        assert_eq!(item.input, vec![6, 7, 8]);
         assert_eq!(item.target, vec![7, 8, 9]);
     }
 

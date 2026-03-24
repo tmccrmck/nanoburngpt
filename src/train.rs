@@ -1,23 +1,23 @@
 use crate::{
     data::{BpeTokenizer, TextDataset, TextGenerationBatch, TextGenerationBatcher, load_text},
     datasets::Dataset,
-    model::{GPTConfig, GPT},
+    model::{GPT, GPTConfig},
 };
 use burn::{
     config::Config,
     data::dataloader::DataLoaderBuilder,
+    grad_clipping::GradientClippingConfig,
     module::Module,
     nn::loss::CrossEntropyLossConfig,
-    grad_clipping::GradientClippingConfig,
     optim::AdamWConfig,
     optim::lr_scheduler::LrScheduler,
     record::CompactRecorder,
     tensor::backend::{AutodiffBackend, Backend},
     train::{
-        checkpoint::MetricCheckpointingStrategy,
-        metric::{AccuracyMetric, LossMetric, PerplexityMetric},
-        metric::store::{Aggregate, Direction, Split},
         ClassificationOutput, InferenceStep, Learner, SupervisedTraining, TrainOutput, TrainStep,
+        checkpoint::MetricCheckpointingStrategy,
+        metric::store::{Aggregate, Direction, Split},
+        metric::{AccuracyMetric, LossMetric, PerplexityMetric},
     },
 };
 
@@ -97,8 +97,8 @@ impl LrScheduler for WarmupCosineScheduler {
             self.min_lr
         } else {
             // Cosine decay: max_lr → min_lr
-            let progress = (iter - self.warmup_iters) as f64
-                / (self.total_iters - self.warmup_iters) as f64;
+            let progress =
+                (iter - self.warmup_iters) as f64 / (self.total_iters - self.warmup_iters) as f64;
             let coeff = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
             self.min_lr + coeff * (self.max_lr - self.min_lr)
         }
@@ -171,13 +171,17 @@ pub fn run_training<B: AutodiffBackend>(
     training_config: TrainingConfig,
 ) {
     // --- Data ---
-    let data_path = dataset.ensure_downloaded().expect("Dataset download failed");
+    let data_path = dataset
+        .ensure_downloaded()
+        .expect("Dataset download failed");
     let (train_dataset, val_dataset) =
         load_text(&data_path, gpt_config.block_size).expect("Failed to load dataset");
 
     // Optionally cap the training set for smoke tests
     let train_dataset = if training_config.max_train_items > 0 {
-        let cap = training_config.max_train_items.min(train_dataset.data.len());
+        let cap = training_config
+            .max_train_items
+            .min(train_dataset.data.len());
         TextDataset::new(train_dataset.data[..cap].to_vec(), gpt_config.block_size)
     } else {
         train_dataset
@@ -187,7 +191,9 @@ pub fn run_training<B: AutodiffBackend>(
     println!("Vocab size: {} (BPE r50k_base)", gpt_config.vocab_size);
 
     std::fs::create_dir_all("artifacts").ok();
-    gpt_config.save("artifacts/config.json").expect("Config saved");
+    gpt_config
+        .save("artifacts/config.json")
+        .expect("Config saved");
 
     // Compute total training steps for the LR schedule
     let steps_per_epoch = train_dataset.len() / training_config.batch_size;
@@ -257,7 +263,6 @@ pub fn run_training<B: AutodiffBackend>(
         .save_file("artifacts/model_final", &CompactRecorder::new())
         .expect("Failed to save final model");
     println!("Model saved to artifacts/model_final");
-
 }
 
 // ---------------------------------------------------------------------------
@@ -268,10 +273,10 @@ pub fn run_training<B: AutodiffBackend>(
 mod tests {
     use super::*;
     use burn::backend::Autodiff;
-    use burn_ndarray::NdArray;
-    use burn::optim::Optimizer;
     use burn::data::dataloader::Dataset as BurnDataset;
     use burn::data::dataloader::batcher::Batcher;
+    use burn::optim::Optimizer;
+    use burn_ndarray::NdArray;
 
     fn scheduler(max_lr: f64, min_lr: f64, warmup: usize, total: usize) -> WarmupCosineScheduler {
         WarmupCosineScheduler::new(max_lr, min_lr, warmup, total)
@@ -334,7 +339,7 @@ mod tests {
         let block_size = 4;
         let data: Vec<usize> = vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
         let dataset = TextDataset::new(data, block_size);
-        
+
         let config = GPTConfig {
             vocab_size: 3,
             n_layer: 1,
@@ -367,6 +372,11 @@ mod tests {
         let output = model.forward_classification(batch);
         let final_loss = output.loss.into_scalar();
 
-        assert!(final_loss < initial_loss, "Loss did not decrease: {} -> {}", initial_loss, final_loss);
+        assert!(
+            final_loss < initial_loss,
+            "Loss did not decrease: {} -> {}",
+            initial_loss,
+            final_loss
+        );
     }
 }

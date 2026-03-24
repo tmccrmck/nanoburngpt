@@ -1,6 +1,5 @@
 use std::{
-    fmt,
-    fs,
+    fmt, fs,
     io::{Cursor, Read},
     path::PathBuf,
 };
@@ -116,7 +115,8 @@ fn download_wikitext103(dest: &std::path::Path) -> anyhow::Result<()> {
                     .collect();
                 anyhow::bail!(
                     "Could not find '{}' in zip. Available files: {:?}",
-                    name, names
+                    name,
+                    names
                 );
             }
         }

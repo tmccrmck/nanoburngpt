@@ -3906,6 +3906,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
+ "burn-ndarray",
  "clap",
  "rand 0.10.0",
  "reqwest 0.13.2",

@@ -267,6 +267,11 @@ pub fn run_training<B: AutodiffBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::backend::Autodiff;
+    use burn_ndarray::NdArray;
+    use burn::optim::Optimizer;
+    use burn::data::dataloader::Dataset as BurnDataset;
+    use burn::data::dataloader::batcher::Batcher;
 
     fn scheduler(max_lr: f64, min_lr: f64, warmup: usize, total: usize) -> WarmupCosineScheduler {
         WarmupCosineScheduler::new(max_lr, min_lr, warmup, total)
@@ -318,5 +323,50 @@ mod tests {
         let mut s = scheduler(1.0, 0.1, 0, 10);
         let lr = s.step();
         assert!((lr - 1.0).abs() < 1e-10, "got {lr}");
+    }
+
+    #[test]
+    fn test_training_convergence() {
+        type B = Autodiff<NdArray<f32>>;
+        let device = Default::default();
+
+        // 1. Create a tiny dataset: "ABCABCABC..."
+        let block_size = 4;
+        let data: Vec<usize> = vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
+        let dataset = TextDataset::new(data, block_size);
+        
+        let config = GPTConfig {
+            vocab_size: 3,
+            n_layer: 1,
+            n_head: 1,
+            n_embd: 8,
+            block_size,
+            dropout: 0.0,
+        };
+        let mut model = GPT::<B>::new(&config, &device);
+
+        let mut optim = AdamWConfig::new().init();
+        let mut lr_scheduler = WarmupCosineScheduler::new(0.01, 0.01, 0, 100);
+        let batcher = TextGenerationBatcher::<B>::new(block_size);
+
+        // 2. Initial loss
+        let item = BurnDataset::get(&dataset, 0).unwrap();
+        let batch = batcher.batch(vec![item.clone()], &device);
+        let output = model.forward_classification(batch);
+        let initial_loss = output.loss.into_scalar();
+
+        // 3. Train for 10 steps
+        for _ in 0..10 {
+            let batch = batcher.batch(vec![item.clone()], &device);
+            let train_output = TrainStep::step(&model, batch);
+            model = optim.step(lr_scheduler.step(), model, train_output.grads);
+        }
+
+        // 4. Final loss
+        let batch = batcher.batch(vec![item.clone()], &device);
+        let output = model.forward_classification(batch);
+        let final_loss = output.loss.into_scalar();
+
+        assert!(final_loss < initial_loss, "Loss did not decrease: {} -> {}", initial_loss, final_loss);
     }
 }

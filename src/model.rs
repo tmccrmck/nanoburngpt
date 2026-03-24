@@ -430,7 +430,7 @@ mod tests {
         // 2. Incremental KV cache pass
         // Process first 4 tokens to warm up cache
         let context = prompt.clone().slice([0..1, 0..prompt_len-1]); // [0, 1, 2, 3]
-        let (_, mut cache) = gpt.forward_cached(context, None);
+        let (_, cache) = gpt.forward_cached(context, None);
 
         // Process 5th token (index 4) using cache
         let last_token = prompt.clone().slice([0..1, prompt_len-1..prompt_len]); // [4]

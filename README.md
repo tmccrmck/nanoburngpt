@@ -84,13 +84,33 @@ cargo run -- generate --max-tokens 100
 
 ## Cloud GPU Training
 
+For high-performance training on NVIDIA GPUs (e.g. RunPod, Lambda Labs, A100/H100), use the provided `Dockerfile`.
+
+### 1. Build and Push (Optional)
+If you want to use your own registry:
 ```sh
-# CUDA backend (e.g. RunPod, Lambda Labs)
-cargo run --release --features cuda -- train \
-  --dataset wikitext103 --model gpt2-small
+docker build -t your-username/nanoburngpt:latest .
+docker push your-username/nanoburngpt:latest
 ```
 
-## Architecture
+### 2. Run on RunPod
+Deploy a Pod with an NVIDIA GPU (RTX 3090 or higher recommended) and use the image `your-username/nanoburngpt:latest` (or just run from source inside a standard PyTorch Pod).
+
+**From Source inside a Pod:**
+```sh
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+
+# Train gpt2-small on WikiText-103
+cargo run --release --features cuda -- train \
+  --model gpt2-small --dataset wikitext103 --batch-size 64
+```
+
+**Using the Helper Script:**
+The `run_cloud.sh` script is the default entry point for the Docker image. It defaults to training `gpt2-small` on `wikitext103`.
+
+### Architecture
 
 Standard decoder-only Transformer (nanoGPT style):
 

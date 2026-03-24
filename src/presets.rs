@@ -36,6 +36,7 @@ impl ModelPreset {
                 n_embd: 64,
                 block_size: 32,
                 dropout: 0.0,
+                rope_theta: 10000.0,
             },
             Self::Gpt2Small => GPTConfig {
                 vocab_size: 50257,
@@ -44,6 +45,7 @@ impl ModelPreset {
                 n_embd: 768,
                 block_size: 1024,
                 dropout: 0.1,
+                rope_theta: 10000.0,
             },
             Self::Gpt2Medium => GPTConfig {
                 vocab_size: 50257,
@@ -52,6 +54,7 @@ impl ModelPreset {
                 n_embd: 1024,
                 block_size: 1024,
                 dropout: 0.1,
+                rope_theta: 10000.0,
             },
             Self::Gpt2Large => GPTConfig {
                 vocab_size: 50257,
@@ -60,6 +63,7 @@ impl ModelPreset {
                 n_embd: 1280,
                 block_size: 1024,
                 dropout: 0.1,
+                rope_theta: 10000.0,
             },
             Self::Gpt2Xl => GPTConfig {
                 vocab_size: 50257,
@@ -68,6 +72,7 @@ impl ModelPreset {
                 n_embd: 1600,
                 block_size: 1024,
                 dropout: 0.1,
+                rope_theta: 10000.0,
             },
         }
     }
@@ -166,7 +171,15 @@ mod tests {
                 "{} n_embd={} n_head={} — not evenly divisible",
                 c.n_embd,
                 c.n_head,
-                c.n_embd
+                c.n_head
+            );
+            let head_dim = c.n_embd / c.n_head;
+            assert_eq!(
+                head_dim % 2,
+                0,
+                "n_embd={} n_head={} head_dim={head_dim} — must be even for RoPE",
+                c.n_embd,
+                c.n_head
             );
         }
     }

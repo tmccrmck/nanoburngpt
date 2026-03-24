@@ -34,7 +34,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && \
 
 # Step 2: Copy actual source and build the real binary
 COPY . .
-RUN cargo build --release --features cuda
+RUN touch src/main.rs src/lib.rs && cargo build --release --features cuda
 
 # Set execution permissions for the cloud helper script
 RUN chmod +x run_cloud.sh

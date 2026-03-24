@@ -136,6 +136,7 @@ where
                 n_embd: n_embd.unwrap_or(preset_cfg.n_embd),
                 block_size: block_size.unwrap_or(preset_cfg.block_size),
                 dropout,
+                rope_theta: preset_cfg.rope_theta,
             };
 
             let dataset_enum = Dataset::from_str(&dataset)

@@ -129,6 +129,9 @@ pub struct GPTConfig {
     pub n_embd: usize,
     pub block_size: usize, // context window
     pub dropout: f64,
+    /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
+    #[config(default = 10000.0)]
+    pub rope_theta: f64,
 }
 
 #[derive(Module, Debug)]
@@ -508,6 +511,7 @@ mod tests {
             n_embd: 32,
             block_size: 16,
             dropout: 0.0,
+            rope_theta: 10000.0,
         }
     }
 

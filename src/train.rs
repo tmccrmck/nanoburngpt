@@ -347,6 +347,7 @@ mod tests {
             n_embd: 8,
             block_size,
             dropout: 0.0,
+            rope_theta: 10000.0,
         };
         let mut model = GPT::<B>::new(&config, &device);
 

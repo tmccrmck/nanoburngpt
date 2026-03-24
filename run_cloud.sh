@@ -6,13 +6,7 @@ set -e
 echo "--- NanoBurnGPT Cloud Helper ---"
 echo "Targeting CUDA backend..."
 
-# 1. Update code if a remote branch is specified
-if [ -n "$GIT_REMOTE_PULL" ]; then
-    echo "Pulling latest code from $GIT_REMOTE_PULL..."
-    git pull origin main || echo "Git pull failed, using local files."
-fi
-
-# 2. Check if a command was passed, otherwise default to training
+# Check if a command was passed, otherwise default to training
 if [ $# -gt 0 ]; then
     echo "Executing custom command: cargo run --release --features cuda -- $@"
     cargo run --release --features cuda -- "$@"

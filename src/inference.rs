@@ -1,5 +1,5 @@
 use crate::data::BpeTokenizer;
-use crate::model::{GPTConfig, GPTRecord, GPT};
+use crate::model::{GPTConfig, GPTRecord, SamplingParams, GPT};
 use burn::{
     config::Config,
     module::Module,
@@ -12,7 +12,7 @@ pub fn generate_text<B: Backend>(
     artifact_dir: &str,
     prompt: &str,
     max_tokens: usize,
-    temperature: f64,
+    sampling: &SamplingParams,
 ) {
     // 1. Load Config
     let config_path = format!("{}/config.json", artifact_dir);
@@ -36,7 +36,7 @@ pub fn generate_text<B: Backend>(
 
     // 5. Generate
     println!("Generating...\n");
-    let generated = model.generate(token_tensor, max_tokens, temperature, config.block_size);
+    let generated = model.generate(token_tensor, max_tokens, sampling, config.block_size);
 
     // 6. Decode
     let data = generated.squeeze::<1>().into_data();

@@ -89,6 +89,12 @@ enum Commands {
         /// Sampling temperature (0 = greedy)
         #[arg(long, default_value_t = 0.8)]
         temperature: f64,
+        /// Top-k sampling: keep only the k most probable tokens (0 = disabled)
+        #[arg(long, default_value_t = 0)]
+        top_k: usize,
+        /// Top-p (nucleus) sampling: keep smallest set with cumulative prob >= p (1.0 = disabled)
+        #[arg(long, default_value_t = 1.0)]
+        top_p: f64,
     },
 }
 
@@ -161,9 +167,16 @@ where
             prompt,
             max_tokens,
             temperature,
+            top_k,
+            top_p,
         } => {
+            let sampling = nanoburngpt::model::SamplingParams {
+                temperature,
+                top_k,
+                top_p,
+            };
             println!("Generating text on device: {:?}", device);
-            generate_text::<B>(device, &artifact_dir, &prompt, max_tokens, temperature);
+            generate_text::<B>(device, &artifact_dir, &prompt, max_tokens, &sampling);
         }
     }
 }

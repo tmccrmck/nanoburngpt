@@ -170,8 +170,8 @@ impl<B: Backend> CausalSelfAttention<B> {
         &self,
         x: Tensor<B, 3>,
         mask: Option<Tensor<B, 4, Bool>>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
+        cos: Tensor<B, 4>,
+        sin: Tensor<B, 4>,
     ) -> Tensor<B, 3> {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
@@ -214,8 +214,8 @@ impl<B: Backend> CausalSelfAttention<B> {
         x: Tensor<B, 3>,
         cache: Option<LayerKV<B>>,
         mask: Option<Tensor<B, 4, Bool>>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
+        cos: Tensor<B, 4>,
+        sin: Tensor<B, 4>,
     ) -> (Tensor<B, 3>, LayerKV<B>) {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
@@ -317,8 +317,8 @@ impl<B: Backend> Block<B> {
         &self,
         x: Tensor<B, 3>,
         mask: Option<Tensor<B, 4, Bool>>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
+        cos: Tensor<B, 4>,
+        sin: Tensor<B, 4>,
     ) -> Tensor<B, 3> {
         let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()), mask, cos, sin);
         let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
@@ -330,8 +330,8 @@ impl<B: Backend> Block<B> {
         x: Tensor<B, 3>,
         cache: Option<LayerKV<B>>,
         mask: Option<Tensor<B, 4, Bool>>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
+        cos: Tensor<B, 4>,
+        sin: Tensor<B, 4>,
     ) -> (Tensor<B, 3>, LayerKV<B>) {
         let (attn_out, new_cache) =
             self.attn
@@ -350,9 +350,10 @@ pub struct GPT<B: Backend> {
     // Pre-computed causal mask [1, 1, block_size, block_size] — created once, sliced in forward.
     // Stored as a raw Tensor (not Param) so it's not a learnable parameter.
     causal_mask: Tensor<B, 4, Bool>,
-    // RoPE frequency tables [block_size, head_dim/2] — precomputed, constant (no grad).
-    rope_cos: Tensor<B, 2>,
-    rope_sin: Tensor<B, 2>,
+    // RoPE frequency tables [1, 1, block_size, head_dim/2] — precomputed, constant (no grad).
+    // Pre-shaped for broadcasting over batch and n_head dims; no reshape needed in forward.
+    rope_cos: Tensor<B, 4>,
+    rope_sin: Tensor<B, 4>,
 }
 
 impl<B: Backend> GPT<B> {
@@ -399,9 +400,9 @@ impl<B: Backend> GPT<B> {
         }
 
         let rope_cos = Tensor::<B, 1>::from_floats(cos_data.as_slice(), device)
-            .reshape([bs, half]);
+            .reshape([1, 1, bs, half]);
         let rope_sin = Tensor::<B, 1>::from_floats(sin_data.as_slice(), device)
-            .reshape([bs, half]);
+            .reshape([1, 1, bs, half]);
 
         Self {
             token_embedding,
@@ -426,9 +427,9 @@ impl<B: Backend> GPT<B> {
             .slice([0..1, 0..1, 0..seq_len, 0..seq_len]);
 
         // Slice RoPE tables for positions 0..seq_len
-        let half = self.rope_cos.dims()[1];
-        let cos = self.rope_cos.clone().slice([0..seq_len, 0..half]);
-        let sin = self.rope_sin.clone().slice([0..seq_len, 0..half]);
+        let half = self.rope_cos.dims()[3];
+        let cos = self.rope_cos.clone().slice([0..1, 0..1, 0..seq_len, 0..half]);
+        let sin = self.rope_sin.clone().slice([0..1, 0..1, 0..seq_len, 0..half]);
 
         for block in &self.blocks {
             x = block.forward(x, Some(mask.clone()), cos.clone(), sin.clone());
@@ -472,15 +473,15 @@ impl<B: Backend> GPT<B> {
         };
 
         // Slice RoPE tables at the correct absolute positions
-        let half = self.rope_cos.dims()[1];
+        let half = self.rope_cos.dims()[3];
         let cos = self
             .rope_cos
             .clone()
-            .slice([pos_offset..pos_offset + seq_len, 0..half]);
+            .slice([0..1, 0..1, pos_offset..pos_offset + seq_len, 0..half]);
         let sin = self
             .rope_sin
             .clone()
-            .slice([pos_offset..pos_offset + seq_len, 0..half]);
+            .slice([0..1, 0..1, pos_offset..pos_offset + seq_len, 0..half]);
 
         let mut new_layers = Vec::with_capacity(self.blocks.len());
         for (i, block) in self.blocks.iter().enumerate() {
@@ -559,12 +560,12 @@ impl<B: Backend> GPT<B> {
 ///
 /// # Arguments
 /// * `x`   — `[batch, n_head, seq_len, head_dim]`
-/// * `cos` — `[seq_len, head_dim/2]`  (precomputed, already sliced to seq positions)
-/// * `sin` — `[seq_len, head_dim/2]`
+/// * `cos` — `[1, 1, seq_len, head_dim/2]`  (precomputed, sliced to seq positions, pre-shaped for broadcast)
+/// * `sin` — `[1, 1, seq_len, head_dim/2]`
 fn apply_rope<B: Backend>(
     x: Tensor<B, 4>,
-    cos: Tensor<B, 2>,
-    sin: Tensor<B, 2>,
+    cos: Tensor<B, 4>,
+    sin: Tensor<B, 4>,
 ) -> Tensor<B, 4> {
     let [batch, n_head, seq_len, head_dim] = x.dims();
     let half = head_dim / 2;
@@ -572,10 +573,7 @@ fn apply_rope<B: Backend>(
     let x1 = x.clone().slice([0..batch, 0..n_head, 0..seq_len, 0..half]);
     let x2 = x.slice([0..batch, 0..n_head, 0..seq_len, half..head_dim]);
 
-    // Reshape for broadcasting over batch and n_head dims
-    let cos = cos.reshape([1, 1, seq_len, half]);
-    let sin = sin.reshape([1, 1, seq_len, half]);
-
+    // cos/sin are already shaped [1, 1, seq_len, half] — broadcast over batch and n_head
     // Split-half rotation:
     //   new_first_half  = x1 * cos - x2 * sin
     //   new_second_half = x1 * sin + x2 * cos
@@ -602,9 +600,9 @@ mod tests {
         let device = Default::default();
         // x: [batch=1, heads=1, seq=1, head_dim=4]
         let x = Tensor::<B, 4>::from_floats([[[[1.0_f32, 2.0, 3.0, 4.0]]]], &device);
-        // cos=[1,1], sin=[0,0] — shape [seq=1, half=2]
-        let cos = Tensor::<B, 2>::from_floats([[1.0_f32, 1.0]], &device);
-        let sin = Tensor::<B, 2>::from_floats([[0.0_f32, 0.0]], &device);
+        // cos=[1,1], sin=[0,0] — shape [1, 1, seq=1, half=2]
+        let cos = Tensor::<B, 4>::from_floats([[[[1.0_f32, 1.0]]]], &device);
+        let sin = Tensor::<B, 4>::from_floats([[[[0.0_f32, 0.0]]]], &device);
         let result = apply_rope(x.clone(), cos, sin);
         let diff = (result - x).abs().sum().into_scalar();
         assert!(diff < 1e-6, "RoPE at pos=0 should be identity, diff={diff}");
@@ -617,8 +615,8 @@ mod tests {
         let (batch, n_head, seq_len, head_dim) = (2, 4, 8, 16);
         let half = head_dim / 2;
         let x = Tensor::<B, 4>::zeros([batch, n_head, seq_len, head_dim], &device);
-        let cos = Tensor::<B, 2>::ones([seq_len, half], &device);
-        let sin = Tensor::<B, 2>::zeros([seq_len, half], &device);
+        let cos = Tensor::<B, 4>::ones([1, 1, seq_len, half], &device);
+        let sin = Tensor::<B, 4>::zeros([1, 1, seq_len, half], &device);
         let result = apply_rope(x, cos, sin);
         assert_eq!(result.dims(), [batch, n_head, seq_len, head_dim]);
     }

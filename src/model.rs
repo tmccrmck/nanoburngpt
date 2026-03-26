@@ -496,12 +496,78 @@ impl<B: Backend> GPT<B> {
     }
 }
 
+/// Apply Rotary Position Embeddings to a query or key tensor.
+///
+/// Uses the split-half formulation: the first `head_dim/2` dims pair with
+/// the second `head_dim/2` dims. Applied to Q and K only, never to V.
+///
+/// # Arguments
+/// * `x`   — `[batch, n_head, seq_len, head_dim]`
+/// * `cos` — `[seq_len, head_dim/2]`  (precomputed, already sliced to seq positions)
+/// * `sin` — `[seq_len, head_dim/2]`
+fn apply_rope<B: Backend>(
+    x: Tensor<B, 4>,
+    cos: Tensor<B, 2>,
+    sin: Tensor<B, 2>,
+) -> Tensor<B, 4> {
+    let [batch, n_head, seq_len, head_dim] = x.dims();
+    let half = head_dim / 2;
+
+    let x1 = x.clone().slice([0..batch, 0..n_head, 0..seq_len, 0..half]);
+    let x2 = x.slice([0..batch, 0..n_head, 0..seq_len, half..head_dim]);
+
+    // Reshape for broadcasting over batch and n_head dims
+    let cos = cos.reshape([1, 1, seq_len, half]);
+    let sin = sin.reshape([1, 1, seq_len, half]);
+
+    // Split-half rotation:
+    //   new_first_half  = x1 * cos - x2 * sin
+    //   new_second_half = x1 * sin + x2 * cos
+    Tensor::cat(
+        vec![
+            x1.clone() * cos.clone() - x2.clone() * sin.clone(),
+            x1 * sin + x2 * cos,
+        ],
+        3,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
+
+    #[test]
+    fn test_apply_rope_at_position_zero() {
+        // At position 0: angle = 0 * freq = 0, so cos=1 and sin=0.
+        // Rotation matrix is identity — output must equal input.
+        type B = NdArray<f32>;
+        let device = Default::default();
+        // x: [batch=1, heads=1, seq=1, head_dim=4]
+        let x = Tensor::<B, 4>::from_floats([[[[1.0_f32, 2.0, 3.0, 4.0]]]], &device);
+        // cos=[1,1], sin=[0,0] — shape [seq=1, half=2]
+        let cos = Tensor::<B, 2>::from_floats([[1.0_f32, 1.0]], &device);
+        let sin = Tensor::<B, 2>::from_floats([[0.0_f32, 0.0]], &device);
+        let result = apply_rope(x.clone(), cos, sin);
+        let diff = (result - x).abs().sum().into_scalar();
+        assert!(diff < 1e-6, "RoPE at pos=0 should be identity, diff={diff}");
+    }
+
+    #[test]
+    fn test_apply_rope_shape() {
+        // Output shape must equal input shape regardless of values.
+        type B = NdArray<f32>;
+        let device = Default::default();
+        let (batch, n_head, seq_len, head_dim) = (2, 4, 8, 16);
+        let half = head_dim / 2;
+        let x = Tensor::<B, 4>::zeros([batch, n_head, seq_len, head_dim], &device);
+        let cos = Tensor::<B, 2>::ones([seq_len, half], &device);
+        let sin = Tensor::<B, 2>::zeros([seq_len, half], &device);
+        let result = apply_rope(x, cos, sin);
+        assert_eq!(result.dims(), [batch, n_head, seq_len, head_dim]);
+    }
 
     fn create_test_config() -> GPTConfig {
         GPTConfig {

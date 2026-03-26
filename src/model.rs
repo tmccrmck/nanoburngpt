@@ -166,16 +166,19 @@ impl<B: Backend> CausalSelfAttention<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4, Bool>>) -> Tensor<B, 3> {
+    pub fn forward(
+        &self,
+        x: Tensor<B, 3>,
+        mask: Option<Tensor<B, 4, Bool>>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
+    ) -> Tensor<B, 3> {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
 
-        // Q, K, V
         let qkv = self.c_attn.forward(x.clone());
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.n_head, head_dim]);
-
         let qkv = qkv.permute([2, 0, 3, 1, 4]);
-        // Use reshape instead of squeeze to avoid ambiguity when batch or seq_len == 1
         let q = qkv
             .clone()
             .slice([0..1])
@@ -189,9 +192,10 @@ impl<B: Backend> CausalSelfAttention<B> {
             .slice([2..3])
             .reshape([batch_size, self.n_head, seq_len, head_dim]);
 
-        // Burn's fused SDPA kernel: computes softmax(QK^T / sqrt(d_k)) * V.
-        // May use an optimized kernel on CUDA; standard implementation on wgpu.
-        // Does not support attention dropout (resid_dropout still applied after).
+        // Apply RoPE to Q and K; V is unchanged
+        let q = apply_rope(q, cos.clone(), sin.clone());
+        let k = apply_rope(k, cos, sin);
+
         let y = attention(q, k, v, mask);
 
         let y = y
@@ -210,6 +214,8 @@ impl<B: Backend> CausalSelfAttention<B> {
         x: Tensor<B, 3>,
         cache: Option<LayerKV<B>>,
         mask: Option<Tensor<B, 4, Bool>>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
     ) -> (Tensor<B, 3>, LayerKV<B>) {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
@@ -230,6 +236,10 @@ impl<B: Backend> CausalSelfAttention<B> {
             .clone()
             .slice([2..3])
             .reshape([batch_size, self.n_head, seq_len, head_dim]);
+
+        // Apply RoPE to Q and K before caching — positions are baked in
+        let q = apply_rope(q, cos.clone(), sin.clone());
+        k = apply_rope(k, cos, sin);
 
         // Concatenate with cached K, V from previous steps
         if let Some((cached_k, cached_v)) = cache {
@@ -303,8 +313,14 @@ impl<B: Backend> Block<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4, Bool>>) -> Tensor<B, 3> {
-        let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()), mask);
+    pub fn forward(
+        &self,
+        x: Tensor<B, 3>,
+        mask: Option<Tensor<B, 4, Bool>>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
+    ) -> Tensor<B, 3> {
+        let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()), mask, cos, sin);
         let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
         x
     }
@@ -314,10 +330,12 @@ impl<B: Backend> Block<B> {
         x: Tensor<B, 3>,
         cache: Option<LayerKV<B>>,
         mask: Option<Tensor<B, 4, Bool>>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
     ) -> (Tensor<B, 3>, LayerKV<B>) {
         let (attn_out, new_cache) =
             self.attn
-                .forward_cached(self.ln_1.forward(x.clone()), cache, mask);
+                .forward_cached(self.ln_1.forward(x.clone()), cache, mask, cos, sin);
         let x = x + attn_out;
         let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
         (x, new_cache)
@@ -327,20 +345,19 @@ impl<B: Backend> Block<B> {
 #[derive(Module, Debug)]
 pub struct GPT<B: Backend> {
     token_embedding: Embedding<B>,
-    position_embedding: Embedding<B>,
     blocks: Vec<Block<B>>,
     ln_f: LayerNorm<B>,
-    // lm_head is weight-tied to token_embedding — no separate parameter
-    // Full causal mask [1, 1, block_size, block_size] — created once, sliced in forward.
+    // Pre-computed causal mask [1, 1, block_size, block_size] — created once, sliced in forward.
     // Stored as a raw Tensor (not Param) so it's not a learnable parameter.
     causal_mask: Tensor<B, 4, Bool>,
+    // RoPE frequency tables [block_size, head_dim/2] — precomputed, constant (no grad).
+    rope_cos: Tensor<B, 2>,
+    rope_sin: Tensor<B, 2>,
 }
 
 impl<B: Backend> GPT<B> {
     pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
         let token_embedding = EmbeddingConfig::new(config.vocab_size, config.n_embd).init(device);
-        let position_embedding =
-            EmbeddingConfig::new(config.block_size, config.n_embd).init(device);
 
         let blocks = (0..config.n_layer)
             .map(|_| Block::new(config, device))
@@ -355,25 +372,52 @@ impl<B: Backend> GPT<B> {
             .equal_elem(0.0)
             .reshape([1, 1, bs, bs]);
 
+        // Pre-compute RoPE frequency tables.
+        // Split-half formulation: head_dim must be even.
+        let head_dim = config.n_embd / config.n_head;
+        assert!(
+            head_dim % 2 == 0,
+            "head_dim ({head_dim}) must be even for RoPE split-half formulation"
+        );
+        let half = head_dim / 2;
+        let theta = config.rope_theta as f32;
+
+        // inv_freqs[i] = 1 / (rope_theta ^ (2i / head_dim))
+        let inv_freqs: Vec<f32> = (0..half)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
+            .collect();
+
+        // Build flat [bs * half] cos/sin arrays, then reshape
+        let mut cos_data = vec![0.0f32; bs * half];
+        let mut sin_data = vec![0.0f32; bs * half];
+        for pos in 0..bs {
+            for i in 0..half {
+                let angle = pos as f32 * inv_freqs[i];
+                cos_data[pos * half + i] = angle.cos();
+                sin_data[pos * half + i] = angle.sin();
+            }
+        }
+
+        let rope_cos = Tensor::<B, 1>::from_floats(cos_data.as_slice(), device)
+            .reshape([bs, half]);
+        let rope_sin = Tensor::<B, 1>::from_floats(sin_data.as_slice(), device)
+            .reshape([bs, half]);
+
         Self {
             token_embedding,
-            position_embedding,
             blocks,
             ln_f,
             causal_mask,
+            rope_cos,
+            rope_sin,
         }
     }
 
     pub fn forward(&self, idx: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let [batch, seq_len] = idx.dims();
-        let device = idx.device();
 
-        let pos = Tensor::arange(0..seq_len as i64, &device).unsqueeze::<2>();
-
-        let tok_emb = self.token_embedding.forward(idx);
-        let pos_emb = self.position_embedding.forward(pos);
-
-        let mut x = tok_emb + pos_emb;
+        // Token embeddings only — position is handled by RoPE inside attention
+        let mut x = self.token_embedding.forward(idx);
 
         // Slice the pre-computed causal mask to the current sequence length
         let mask = self
@@ -381,8 +425,13 @@ impl<B: Backend> GPT<B> {
             .clone()
             .slice([0..1, 0..1, 0..seq_len, 0..seq_len]);
 
+        // Slice RoPE tables for positions 0..seq_len
+        let half = self.rope_cos.dims()[1];
+        let cos = self.rope_cos.clone().slice([0..seq_len, 0..half]);
+        let sin = self.rope_sin.clone().slice([0..seq_len, 0..half]);
+
         for block in &self.blocks {
-            x = block.forward(x, Some(mask.clone()));
+            x = block.forward(x, Some(mask.clone()), cos.clone(), sin.clone());
         }
 
         let x = self.ln_f.forward(x);
@@ -404,19 +453,14 @@ impl<B: Backend> GPT<B> {
         cache: Option<KVCache<B>>,
     ) -> (Tensor<B, 3>, KVCache<B>) {
         let [batch, seq_len] = idx.dims();
-        let device = idx.device();
 
         // Position offset: when we have a cache, new tokens start at cached_len
         let pos_offset = cache.as_ref().map_or(0, |c| c.layers[0].0.dims()[2]);
-        let pos = Tensor::arange(pos_offset as i64..(pos_offset + seq_len) as i64, &device)
-            .unsqueeze::<2>();
 
-        let tok_emb = self.token_embedding.forward(idx);
-        let pos_emb = self.position_embedding.forward(pos);
-        let mut x = tok_emb + pos_emb;
+        // Token embeddings only — position handled by RoPE
+        let mut x = self.token_embedding.forward(idx);
 
-        // Causal mask only needed during prefill (multi-token); single-token decode
-        // needs no mask since it attends to all cached positions + itself.
+        // Causal mask only needed during prefill (multi-token); single-token decode needs no mask
         let mask = if cache.is_none() && seq_len > 1 {
             Some(
                 self.causal_mask
@@ -427,10 +471,22 @@ impl<B: Backend> GPT<B> {
             None
         };
 
+        // Slice RoPE tables at the correct absolute positions
+        let half = self.rope_cos.dims()[1];
+        let cos = self
+            .rope_cos
+            .clone()
+            .slice([pos_offset..pos_offset + seq_len, 0..half]);
+        let sin = self
+            .rope_sin
+            .clone()
+            .slice([pos_offset..pos_offset + seq_len, 0..half]);
+
         let mut new_layers = Vec::with_capacity(self.blocks.len());
         for (i, block) in self.blocks.iter().enumerate() {
             let layer_cache = cache.as_ref().map(|c| c.layers[i].clone());
-            let (out, layer_kv) = block.forward_cached(x, layer_cache, mask.clone());
+            let (out, layer_kv) =
+                block.forward_cached(x, layer_cache, mask.clone(), cos.clone(), sin.clone());
             x = out;
             new_layers.push(layer_kv);
         }
@@ -543,7 +599,6 @@ mod tests {
     fn test_apply_rope_at_position_zero() {
         // At position 0: angle = 0 * freq = 0, so cos=1 and sin=0.
         // Rotation matrix is identity — output must equal input.
-        type B = NdArray<f32>;
         let device = Default::default();
         // x: [batch=1, heads=1, seq=1, head_dim=4]
         let x = Tensor::<B, 4>::from_floats([[[[1.0_f32, 2.0, 3.0, 4.0]]]], &device);
@@ -558,7 +613,6 @@ mod tests {
     #[test]
     fn test_apply_rope_shape() {
         // Output shape must equal input shape regardless of values.
-        type B = NdArray<f32>;
         let device = Default::default();
         let (batch, n_head, seq_len, head_dim) = (2, 4, 8, 16);
         let half = head_dim / 2;

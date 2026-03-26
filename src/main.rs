@@ -77,6 +77,9 @@ enum Commands {
         /// Cap training items (0 = use full dataset; useful for smoke tests)
         #[arg(long, default_value_t = 0)]
         max_train_items: usize,
+        /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
+        #[arg(long, default_value_t = 10000.0)]
+        rope_theta: f64,
     },
     Generate {
         #[arg(long, default_value = "artifacts")]
@@ -124,6 +127,7 @@ where
             beta2,
             weight_decay,
             max_train_items,
+            rope_theta,
         } => {
             let preset = ModelPreset::from_str(&model)
                 .expect("Invalid --model. Use: nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl");
@@ -136,7 +140,7 @@ where
                 n_embd: n_embd.unwrap_or(preset_cfg.n_embd),
                 block_size: block_size.unwrap_or(preset_cfg.block_size),
                 dropout,
-                rope_theta: preset_cfg.rope_theta,
+                rope_theta,
             };
 
             let dataset_enum = Dataset::from_str(&dataset)

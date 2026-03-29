@@ -149,12 +149,14 @@ impl<B: Backend> CausalSelfAttention<B> {
         let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
         Self {
             c_attn: LinearConfig::new(config.n_embd, 3 * config.n_embd)
+                .with_bias(false)
                 .with_initializer(Initializer::Normal {
                     mean: 0.0,
                     std: 0.02,
                 })
                 .init(device),
             c_proj: LinearConfig::new(config.n_embd, config.n_embd)
+                .with_bias(false)
                 .with_initializer(Initializer::Normal {
                     mean: 0.0,
                     std: proj_std,
@@ -272,12 +274,14 @@ impl<B: Backend> MLP<B> {
         let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
         Self {
             c_fc: LinearConfig::new(config.n_embd, 4 * config.n_embd)
+                .with_bias(false)
                 .with_initializer(Initializer::Normal {
                     mean: 0.0,
                     std: 0.02,
                 })
                 .init(device),
             c_proj: LinearConfig::new(4 * config.n_embd, config.n_embd)
+                .with_bias(false)
                 .with_initializer(Initializer::Normal {
                     mean: 0.0,
                     std: proj_std,

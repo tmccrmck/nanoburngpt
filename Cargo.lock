@@ -4309,7 +4309,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
- "burn-ndarray",
+ "burn-flex",
  "clap",
  "criterion",
  "rand 0.10.1",

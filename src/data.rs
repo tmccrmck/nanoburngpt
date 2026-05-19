@@ -209,8 +209,8 @@ mod tests {
 
     #[test]
     fn batcher_output_shapes() {
-        use burn_ndarray::NdArray;
-        type B = NdArray<f32>;
+        use burn_flex::Flex;
+        type B = Flex;
         let block_size = 4;
         let ds = make_dataset(20, block_size);
         let batcher = TextGenerationBatcher::<B>::new(block_size);

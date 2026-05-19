@@ -21,6 +21,10 @@ use nanoburngpt::{
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Force use of CPU (burn-flex backend)
+    #[arg(long, global = true)]
+    cpu: bool,
 }
 
 #[derive(Subcommand)]
@@ -198,12 +202,28 @@ fn main() {
     #[cfg(feature = "cuda")]
     {
         use burn::backend::cuda::{Cuda, CudaDevice};
-        dispatch::<Autodiff<Cuda<f32, i32>>, Cuda<f32, i32>>(cli, CudaDevice::default());
+        if cli.cpu {
+            use burn_flex::Flex;
+            dispatch::<Autodiff<Flex>, Flex>(cli, Default::default());
+        } else {
+            dispatch::<Autodiff<Cuda<f32, i32>>, Cuda<f32, i32>>(cli, CudaDevice::default());
+        }
     }
 
     #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
     {
         use burn::backend::wgpu::{Wgpu, WgpuDevice};
-        dispatch::<Autodiff<Wgpu<f32, i32>>, Wgpu<f32, i32>>(cli, WgpuDevice::default());
+        if cli.cpu {
+            use burn_flex::Flex;
+            dispatch::<Autodiff<Flex>, Flex>(cli, Default::default());
+        } else {
+            dispatch::<Autodiff<Wgpu<f32, i32>>, Wgpu<f32, i32>>(cli, WgpuDevice::default());
+        }
+    }
+
+    #[cfg(not(any(feature = "wgpu", feature = "cuda")))]
+    {
+        use burn_flex::Flex;
+        dispatch::<Autodiff<Flex>, Flex>(cli, Default::default());
     }
 }

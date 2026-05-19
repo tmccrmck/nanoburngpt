@@ -276,7 +276,7 @@ mod tests {
     use burn::data::dataloader::Dataset as BurnDataset;
     use burn::data::dataloader::batcher::Batcher;
     use burn::optim::Optimizer;
-    use burn_ndarray::NdArray;
+    use burn_flex::Flex;
 
     fn scheduler(max_lr: f64, min_lr: f64, warmup: usize, total: usize) -> WarmupCosineScheduler {
         WarmupCosineScheduler::new(max_lr, min_lr, warmup, total)
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_training_convergence() {
-        type B = Autodiff<NdArray<f32>>;
+        type B = Autodiff<Flex>;
         let device = Default::default();
 
         // 1. Create a tiny dataset: "ABCABCABC..."

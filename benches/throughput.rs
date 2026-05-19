@@ -9,13 +9,13 @@
 ///   cargo bench -- forward          # filter by name
 ///   cargo bench -- --save-baseline main
 ///   cargo bench -- --baseline main  # compare against saved baseline
-use burn_ndarray::NdArray;
+use burn_flex::Flex;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use nanoburngpt::model::{GPT, GPTConfig, SamplingParams};
 use burn::tensor::{Int, Tensor};
 
-// Use the same integer type as the production wgpu backend.
-type B = NdArray<f32, i32>;
+// Use Flex as the default CPU backend for benchmarking.
+type B = Flex;
 
 fn make_config(n_layer: usize, n_head: usize, n_embd: usize, block_size: usize) -> GPTConfig {
     GPTConfig {

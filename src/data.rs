@@ -22,6 +22,10 @@ impl TextDataset {
             self.data.len() - self.block_size
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Dataset<TextDatasetItem> for TextDataset {
@@ -93,6 +97,12 @@ impl<B: Backend> Batcher<B, TextDatasetItem, TextGenerationBatch<B>> for TextGen
 
 pub struct BpeTokenizer {
     bpe: tiktoken_rs::CoreBPE,
+}
+
+impl Default for BpeTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BpeTokenizer {
@@ -189,5 +199,41 @@ mod tests {
         let ds = make_dataset(10, 3);
         assert!(ds.get(ds.len()).is_none());
         assert!(ds.get(100).is_none());
+    }
+
+    #[test]
+    fn is_empty_reflects_len() {
+        assert!(make_dataset(3, 3).is_empty());
+        assert!(!make_dataset(10, 3).is_empty());
+    }
+
+    #[test]
+    fn batcher_output_shapes() {
+        use burn_ndarray::NdArray;
+        type B = NdArray<f32>;
+        let block_size = 4;
+        let ds = make_dataset(20, block_size);
+        let batcher = TextGenerationBatcher::<B>::new(block_size);
+        let items: Vec<_> = (0..3).filter_map(|i| ds.get(i)).collect();
+        let batch = batcher.batch(items, &Default::default());
+        assert_eq!(batch.inputs.dims(), [3, block_size]);
+        assert_eq!(batch.targets.dims(), [3, block_size]);
+    }
+
+    #[test]
+    fn tokenizer_round_trips_ascii() {
+        let tok = BpeTokenizer::new();
+        let text = "Hello, world!";
+        let encoded = tok.encode(text);
+        let decoded = tok.decode(&encoded);
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn tokenizer_default_equals_new() {
+        // Verifies Default impl is wired up correctly
+        let tok = BpeTokenizer::default();
+        let text = "test";
+        assert_eq!(tok.encode(text), BpeTokenizer::new().encode(text));
     }
 }

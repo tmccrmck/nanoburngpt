@@ -67,7 +67,7 @@ fn sample_token<B: Backend>(
 
 /// Apply top-k and top-p filtering to a probability distribution, returning
 /// a new distribution with excluded tokens zeroed out and probabilities renormalized.
-fn filter_top_k_p(probs: &[f32], top_k: usize, top_p: f64) -> Vec<f32> {
+pub fn filter_top_k_p(probs: &[f32], top_k: usize, top_p: f64) -> Vec<f32> {
     let vocab = probs.len();
 
     // Sort indices by descending probability
@@ -180,17 +180,21 @@ impl<B: Backend> CausalSelfAttention<B> {
 
         let qkv = self.c_attn.forward(x.clone());
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.n_head, head_dim]);
+        // permute → [3, batch, n_head, seq, head_dim]; each slice extracts one of Q/K/V
+        #[allow(clippy::single_range_in_vec_init)]
         let qkv = qkv.permute([2, 0, 3, 1, 4]);
+        #[allow(clippy::single_range_in_vec_init)]
         let q = qkv
             .clone()
             .slice([0..1])
             .reshape([batch_size, self.n_head, seq_len, head_dim]);
+        #[allow(clippy::single_range_in_vec_init)]
         let k = qkv
             .clone()
             .slice([1..2])
             .reshape([batch_size, self.n_head, seq_len, head_dim]);
+        #[allow(clippy::single_range_in_vec_init)]
         let v = qkv
-            .clone()
             .slice([2..3])
             .reshape([batch_size, self.n_head, seq_len, head_dim]);
 
@@ -224,18 +228,21 @@ impl<B: Backend> CausalSelfAttention<B> {
 
         let qkv = self.c_attn.forward(x.clone());
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.n_head, head_dim]);
+        #[allow(clippy::single_range_in_vec_init)]
         let qkv = qkv.permute([2, 0, 3, 1, 4]);
 
+        #[allow(clippy::single_range_in_vec_init)]
         let q = qkv
             .clone()
             .slice([0..1])
             .reshape([batch_size, self.n_head, seq_len, head_dim]);
+        #[allow(clippy::single_range_in_vec_init)]
         let mut k = qkv
             .clone()
             .slice([1..2])
             .reshape([batch_size, self.n_head, seq_len, head_dim]);
+        #[allow(clippy::single_range_in_vec_init)]
         let mut v = qkv
-            .clone()
             .slice([2..3])
             .reshape([batch_size, self.n_head, seq_len, head_dim]);
 
@@ -325,8 +332,7 @@ impl<B: Backend> Block<B> {
         sin: Tensor<B, 4>,
     ) -> Tensor<B, 3> {
         let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()), mask, cos, sin);
-        let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
-        x
+        x.clone() + self.mlp.forward(self.ln_2.forward(x))
     }
 
     pub fn forward_cached(
@@ -381,7 +387,7 @@ impl<B: Backend> GPT<B> {
         // Split-half formulation: head_dim must be even.
         let head_dim = config.n_embd / config.n_head;
         assert!(
-            head_dim % 2 == 0,
+            head_dim.is_multiple_of(2),
             "head_dim ({head_dim}) must be even for RoPE split-half formulation"
         );
         let half = head_dim / 2;
@@ -595,7 +601,9 @@ mod tests {
     use super::*;
     use burn_ndarray::NdArray;
 
-    type B = NdArray<f32>;
+    // Use i32 integers to match the production Wgpu<f32, i32> backend; generate() reads
+    // token ids as i32 and would panic with the NdArray<f32> default of i64.
+    type B = NdArray<f32, i32>;
 
     #[test]
     fn test_apply_rope_at_position_zero() {
@@ -743,5 +751,100 @@ mod tests {
         for (i, &p) in result.iter().enumerate() {
             assert!((p - 0.25).abs() < 1e-5, "index {i}: {p}");
         }
+    }
+
+    #[test]
+    fn top_k_1_keeps_only_argmax() {
+        let probs = vec![0.1, 0.6, 0.2, 0.1];
+        let result = filter_top_k_p(&probs, 1, 1.0);
+        // Only the highest-prob token (index 1) survives, renormalized to 1.0
+        assert_eq!(result[0], 0.0);
+        assert!((result[1] - 1.0).abs() < 1e-5, "expected 1.0, got {}", result[1]);
+        assert_eq!(result[2], 0.0);
+        assert_eq!(result[3], 0.0);
+    }
+
+    #[test]
+    fn apply_rope_preserves_norm() {
+        // RoPE is a rotation, so it must preserve the L2 norm of every head vector.
+        let device = Default::default();
+        let (batch, n_head, seq_len, head_dim) = (1, 2, 4, 8);
+        let half = head_dim / 2;
+
+        let x = Tensor::<B, 4>::from_floats(
+            [[[[1.0, -2.0, 3.0, 0.5, -1.0, 2.0, -0.5, 1.5],
+               [0.5, 1.0, -1.5, 2.0, 0.1, -0.3, 1.2, -0.8],
+               [2.0, 1.0, 0.0, -1.0, 0.5, -0.5, 1.0, -1.0],
+               [-1.0, 0.0, 1.0, 0.5, -0.5, 0.5, -1.0, 0.5]],
+              [[-0.5, 1.5, -2.0, 0.5, 1.0, -1.0, 0.5, -1.5],
+               [1.0, 0.5, -0.5, -1.0, 0.5, 1.5, -2.0, 0.5],
+               [0.0, 1.0, -1.0, 0.5, -0.5, 0.5, 1.0, 0.0],
+               [1.5, -0.5, 0.5, -1.5, 1.0, -1.0, 0.5, -0.5]]]],
+            &device,
+        );
+
+        // Build non-trivial cos/sin values (arbitrary rotations per position/freq)
+        let cos_vals: Vec<f32> = (0..seq_len * half)
+            .map(|i| (i as f32 * 0.3).cos())
+            .collect();
+        let sin_vals: Vec<f32> = (0..seq_len * half)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
+        let cos = Tensor::<B, 1>::from_floats(cos_vals.as_slice(), &device)
+            .reshape([1, 1, seq_len, half]);
+        let sin = Tensor::<B, 1>::from_floats(sin_vals.as_slice(), &device)
+            .reshape([1, 1, seq_len, half]);
+
+        let rotated = apply_rope(x.clone(), cos, sin);
+
+        // Compare per-head-vector norms: ||x||² == ||rotated_x||²
+        for b in 0..batch {
+            for h in 0..n_head {
+                for s in 0..seq_len {
+                    let orig_vec = x.clone().slice([b..b+1, h..h+1, s..s+1, 0..head_dim]);
+                    let rot_vec = rotated.clone().slice([b..b+1, h..h+1, s..s+1, 0..head_dim]);
+                    let norm_orig = orig_vec.powf_scalar(2.0).sum().into_scalar().sqrt();
+                    let norm_rot = rot_vec.powf_scalar(2.0).sum().into_scalar().sqrt();
+                    assert!(
+                        (norm_orig - norm_rot).abs() < 1e-5,
+                        "norm changed at ({b},{h},{s}): {norm_orig} -> {norm_rot}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generate_produces_correct_number_of_tokens() {
+        let device = Default::default();
+        let config = create_test_config();
+        let gpt = GPT::<B>::new(&config, &device);
+
+        let prompt_len = 3;
+        let max_new = 5;
+        let prompt = Tensor::<B, 2, Int>::zeros([1, prompt_len], &device);
+        let sampling = SamplingParams { temperature: 0.0, top_k: 0, top_p: 1.0 };
+
+        let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {});
+        let [_, total_len] = output.dims();
+        assert_eq!(total_len, prompt_len + max_new);
+    }
+
+    #[test]
+    fn generate_respects_block_size_limit() {
+        let device = Default::default();
+        let config = create_test_config(); // block_size = 16
+        let gpt = GPT::<B>::new(&config, &device);
+
+        // Start with a prompt that's already close to block_size
+        let prompt_len = 14;
+        let max_new = 10; // Would exceed block_size if unchecked
+        let prompt = Tensor::<B, 2, Int>::zeros([1, prompt_len], &device);
+        let sampling = SamplingParams { temperature: 0.0, top_k: 0, top_p: 1.0 };
+
+        let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {});
+        let [_, total_len] = output.dims();
+        // Should stop at block_size (16), not at 14 + 10 = 24
+        assert!(total_len <= config.block_size, "output len {total_len} exceeds block_size {}", config.block_size);
     }
 }

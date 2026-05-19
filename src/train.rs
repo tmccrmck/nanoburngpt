@@ -331,6 +331,31 @@ mod tests {
     }
 
     #[test]
+    fn warmup_cosine_transition_is_continuous() {
+        // The LR at the last warmup step (max_lr) and the first cosine step (progress=0 → max_lr)
+        // should be identical — no discontinuity at the boundary.
+        let max_lr = 1.0_f64;
+        let min_lr = 0.1;
+        let warmup = 5;
+        let total = 20;
+        let mut s = scheduler(max_lr, min_lr, warmup, total);
+        let lrs = steps(&mut s, warmup + 1);
+        // lrs[warmup-1] is the last warmup step (should be max_lr)
+        // lrs[warmup]   is the first cosine step (progress=0 → max_lr)
+        assert!((lrs[warmup - 1] - max_lr).abs() < 1e-10, "last warmup step: {}", lrs[warmup - 1]);
+        assert!((lrs[warmup] - max_lr).abs() < 1e-10, "first cosine step: {}", lrs[warmup]);
+    }
+
+    #[test]
+    fn cosine_decays_monotonically() {
+        let mut s = scheduler(1.0, 0.1, 0, 20);
+        let lrs = steps(&mut s, 20);
+        for w in lrs.windows(2) {
+            assert!(w[0] >= w[1], "LR increased: {} -> {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
     fn test_training_convergence() {
         type B = Autodiff<NdArray<f32>>;
         let device = Default::default();

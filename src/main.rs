@@ -129,7 +129,8 @@ where
             max_train_items,
             rope_theta,
         } => {
-            let preset = ModelPreset::from_str(&model)
+            let preset = model
+                .parse::<ModelPreset>()
                 .expect("Invalid --model. Use: nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl");
             let preset_cfg = preset.config();
 

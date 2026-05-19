@@ -11,19 +11,6 @@ pub enum ModelPreset {
 }
 
 impl ModelPreset {
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "nano" => Ok(Self::Nano),
-            "gpt2-small" => Ok(Self::Gpt2Small),
-            "gpt2-medium" => Ok(Self::Gpt2Medium),
-            "gpt2-large" => Ok(Self::Gpt2Large),
-            "gpt2-xl" => Ok(Self::Gpt2Xl),
-            other => anyhow::bail!(
-                "Unknown model preset '{}'. Available: nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl",
-                other
-            ),
-        }
-    }
 
     /// Return the GPTConfig for this preset.
     /// vocab_size is always 50257 (BpeTokenizer::VOCAB_SIZE).
@@ -94,7 +81,17 @@ impl FromStr for ModelPreset {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_str(s)
+        match s {
+            "nano" => Ok(Self::Nano),
+            "gpt2-small" => Ok(Self::Gpt2Small),
+            "gpt2-medium" => Ok(Self::Gpt2Medium),
+            "gpt2-large" => Ok(Self::Gpt2Large),
+            "gpt2-xl" => Ok(Self::Gpt2Xl),
+            other => anyhow::bail!(
+                "Unknown model preset '{}'. Available: nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl",
+                other
+            ),
+        }
     }
 }
 
@@ -108,32 +105,17 @@ mod tests {
 
     #[test]
     fn from_str_all_variants() {
-        assert!(matches!(
-            ModelPreset::from_str("nano").unwrap(),
-            ModelPreset::Nano
-        ));
-        assert!(matches!(
-            ModelPreset::from_str("gpt2-small").unwrap(),
-            ModelPreset::Gpt2Small
-        ));
-        assert!(matches!(
-            ModelPreset::from_str("gpt2-medium").unwrap(),
-            ModelPreset::Gpt2Medium
-        ));
-        assert!(matches!(
-            ModelPreset::from_str("gpt2-large").unwrap(),
-            ModelPreset::Gpt2Large
-        ));
-        assert!(matches!(
-            ModelPreset::from_str("gpt2-xl").unwrap(),
-            ModelPreset::Gpt2Xl
-        ));
+        assert!(matches!("nano".parse::<ModelPreset>().unwrap(), ModelPreset::Nano));
+        assert!(matches!("gpt2-small".parse::<ModelPreset>().unwrap(), ModelPreset::Gpt2Small));
+        assert!(matches!("gpt2-medium".parse::<ModelPreset>().unwrap(), ModelPreset::Gpt2Medium));
+        assert!(matches!("gpt2-large".parse::<ModelPreset>().unwrap(), ModelPreset::Gpt2Large));
+        assert!(matches!("gpt2-xl".parse::<ModelPreset>().unwrap(), ModelPreset::Gpt2Xl));
     }
 
     #[test]
     fn from_str_unknown_errors() {
-        assert!(ModelPreset::from_str("gpt3").is_err());
-        assert!(ModelPreset::from_str("").is_err());
+        assert!("gpt3".parse::<ModelPreset>().is_err());
+        assert!("".parse::<ModelPreset>().is_err());
     }
 
     #[test]

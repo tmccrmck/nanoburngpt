@@ -10,7 +10,7 @@ cuda = ["burn/cuda"]
 
 [dependencies]
 anyhow = "1.0.102"
-burn = { version = "0.20.1", features = ["train", "tui"] }
+burn = { version = "0.21.0", features = ["train", "tui"] }
 clap = { version = "4.6.0", features = ["derive"] }
 rand = "0.10.0"
 reqwest = { version = "0.13.2", features = ["blocking"] }
@@ -18,7 +18,7 @@ tiktoken-rs = "0.9.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-burn-ndarray = "0.20.1"
+burn-ndarray = "0.21.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

@@ -1,4 +1,5 @@
 use burn::tensor::module::attention;
+use burn::tensor::backend::ops::AttentionModuleOptions;
 use burn::{
     config::Config,
     module::Module,
@@ -6,8 +7,9 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, LayerNorm,
         LayerNormConfig, Linear, LinearConfig,
     },
-    tensor::{Bool, Int, Tensor, activation, backend::Backend},
+    tensor::{activation, backend::Backend, Bool, Int, Tensor, Element},
 };
+use burn::prelude::ToElement;
 use rand::distr::{Distribution, weighted::WeightedIndex};
 
 // ---------------------------------------------------------------------------
@@ -202,7 +204,7 @@ impl<B: Backend> CausalSelfAttention<B> {
         let q = apply_rope(q, cos.clone(), sin.clone());
         let k = apply_rope(k, cos, sin);
 
-        let y = attention(q, k, v, mask);
+        let y = attention(q, k, v, mask, None, AttentionModuleOptions::default());
 
         let y = y
             .permute([0, 2, 1, 3])
@@ -258,7 +260,7 @@ impl<B: Backend> CausalSelfAttention<B> {
 
         let new_cache = (k.clone(), v.clone());
 
-        let y = attention(q, k, v, mask);
+        let y = attention(q, k, v, mask, None, AttentionModuleOptions::default());
 
         let y = y
             .permute([0, 2, 1, 3])
@@ -543,8 +545,7 @@ impl<B: Backend> GPT<B> {
             let idx_next = sample_token::<B>(&logits, sampling, batch, vocab, &device, &mut rng);
 
             // Stream the token to the caller
-            let token_data = idx_next.clone().into_data();
-            let token_id = token_data.as_slice::<i32>().expect("i32")[0];
+            let token_id = idx_next.clone().into_scalar().to_i32();
             on_token(token_id);
 
             all_tokens = Tensor::cat(vec![all_tokens, idx_next.clone()], 1);

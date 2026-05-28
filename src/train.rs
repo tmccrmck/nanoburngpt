@@ -53,6 +53,9 @@ pub struct TrainingConfig {
     /// 0 = full dataset; positive value caps training items (smoke tests).
     #[config(default = 0)]
     pub max_train_items: usize,
+    /// Enable mixed precision (AMP)
+    #[config(default = false)]
+    pub amp: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +373,7 @@ mod tests {
             n_layer: 1,
             n_head: 1,
             n_embd: 8,
+            n_kv_head: None,
             block_size,
             dropout: 0.0,
             rope_theta: 10000.0,

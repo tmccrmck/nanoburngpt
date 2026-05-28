@@ -42,6 +42,9 @@ enum Commands {
         /// Override preset: number of attention heads
         #[arg(long)]
         n_head: Option<usize>,
+        /// Override preset: number of key/value heads for GQA (Grouped-Query Attention)
+        #[arg(long)]
+        n_kv_head: Option<usize>,
         /// Override preset: embedding dimension
         #[arg(long)]
         n_embd: Option<usize>,
@@ -84,6 +87,9 @@ enum Commands {
         /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
         #[arg(long, default_value_t = 10000.0)]
         rope_theta: f64,
+        /// Enable mixed precision (AMP)
+        #[arg(long)]
+        amp: bool,
     },
     Generate {
         #[arg(long, default_value = "artifacts")]
@@ -118,6 +124,7 @@ where
             dataset,
             n_layer,
             n_head,
+            n_kv_head,
             n_embd,
             block_size,
             dropout,
@@ -132,6 +139,7 @@ where
             weight_decay,
             max_train_items,
             rope_theta,
+            amp,
         } => {
             let preset = model
                 .parse::<ModelPreset>()
@@ -142,6 +150,7 @@ where
                 vocab_size: preset_cfg.vocab_size,
                 n_layer: n_layer.unwrap_or(preset_cfg.n_layer),
                 n_head: n_head.unwrap_or(preset_cfg.n_head),
+                n_kv_head,
                 n_embd: n_embd.unwrap_or(preset_cfg.n_embd),
                 block_size: block_size.unwrap_or(preset_cfg.block_size),
                 dropout,
@@ -162,6 +171,7 @@ where
                 weight_decay,
                 num_epochs,
                 max_train_items,
+                amp,
             };
 
             println!(
@@ -199,12 +209,19 @@ where
 fn main() {
     let cli = Cli::parse();
 
+    let amp = match &cli.command {
+        Commands::Train { amp, .. } => *amp,
+        _ => false,
+    };
+
     #[cfg(feature = "cuda")]
     {
         use burn::backend::cuda::{Cuda, CudaDevice};
         if cli.cpu {
             use burn_flex::Flex;
             dispatch::<Autodiff<Flex>, Flex>(cli, Default::default());
+        } else if amp {
+            dispatch::<Autodiff<Cuda<burn::tensor::f16, i32>>, Cuda<burn::tensor::f16, i32>>(cli, CudaDevice::default());
         } else {
             dispatch::<Autodiff<Cuda<f32, i32>>, Cuda<f32, i32>>(cli, CudaDevice::default());
         }
@@ -216,6 +233,8 @@ fn main() {
         if cli.cpu {
             use burn_flex::Flex;
             dispatch::<Autodiff<Flex>, Flex>(cli, Default::default());
+        } else if amp {
+            dispatch::<Autodiff<Wgpu<burn::tensor::f16, i32>>, Wgpu<burn::tensor::f16, i32>>(cli, WgpuDevice::default());
         } else {
             dispatch::<Autodiff<Wgpu<f32, i32>>, Wgpu<f32, i32>>(cli, WgpuDevice::default());
         }

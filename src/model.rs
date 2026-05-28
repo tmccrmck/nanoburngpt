@@ -56,7 +56,7 @@ fn sample_token<B: Backend>(
             let (values, indices) = logits.topk_with_indices(params.top_k, 1);
             let probs = activation::softmax(values, 1);
 
-            let probs_data = probs.into_data();
+            let probs_data = probs.into_data().convert::<f32>();
             let indices_data = indices.into_data();
 
             let probs_f32 = probs_data.as_slice::<f32>().expect("f32 probs");
@@ -78,7 +78,7 @@ fn sample_token<B: Backend>(
 
         // Fallback for nucleus sampling (top_p) or full distribution
         let probs = activation::softmax(logits, 1);
-        let probs_data = probs.into_data();
+        let probs_data = probs.into_data().convert::<f32>();
         let probs_f32 = probs_data.as_slice::<f32>().expect("f32 probs");
 
         let tokens: Vec<i32> = (0..batch)
@@ -156,6 +156,8 @@ pub struct GPTConfig {
     pub n_layer: usize,
     pub n_head: usize,
     pub n_embd: usize,
+    /// Number of key/value heads (for Grouped Query Attention). If None, defaults to n_head.
+    pub n_kv_head: Option<usize>,
     pub block_size: usize, // context window
     pub dropout: f64,
     /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
@@ -170,15 +172,27 @@ pub struct CausalSelfAttention<B: Backend> {
     resid_dropout: Dropout,
     rope: RotaryEncoding<B>,
     n_head: usize,
+    n_kv_head: usize,
     n_embd: usize,
 }
 
 impl<B: Backend> CausalSelfAttention<B> {
     pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
+        let n_kv_head = config.n_kv_head.unwrap_or(config.n_head);
+        assert_eq!(
+            config.n_head % n_kv_head,
+            0,
+            "n_head ({}) must be a multiple of n_kv_head ({})",
+            config.n_head,
+            n_kv_head
+        );
+        let head_dim = config.n_embd / config.n_head;
+        let c_attn_out_dim = (config.n_head + 2 * n_kv_head) * head_dim;
+
         // c_proj is a residual projection — scale down by 1/sqrt(2*n_layer) per nanoGPT
         let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
         Self {
-            c_attn: LinearConfig::new(config.n_embd, 3 * config.n_embd)
+            c_attn: LinearConfig::new(config.n_embd, c_attn_out_dim)
                 .with_bias(false)
                 .with_initializer(Initializer::Normal {
                     mean: 0.0,
@@ -193,10 +207,11 @@ impl<B: Backend> CausalSelfAttention<B> {
                 })
                 .init(device),
             resid_dropout: DropoutConfig::new(config.dropout).init(),
-            rope: RotaryEncodingConfig::new(config.block_size, config.n_embd / config.n_head)
+            rope: RotaryEncodingConfig::new(config.block_size, head_dim)
                 .with_theta(config.rope_theta as f32)
                 .init(device),
             n_head: config.n_head,
+            n_kv_head,
             n_embd: config.n_embd,
         }
     }
@@ -210,28 +225,39 @@ impl<B: Backend> CausalSelfAttention<B> {
         let head_dim = self.n_embd / self.n_head;
 
         let qkv = self.c_attn.forward(x.clone());
-        let qkv = qkv.reshape([batch_size, seq_len, 3, self.n_head, head_dim]);
-        // permute → [3, batch, n_head, seq, head_dim]; each slice extracts one of Q/K/V
-        #[allow(clippy::single_range_in_vec_init)]
-        let qkv = qkv.permute([2, 0, 3, 1, 4]);
-        #[allow(clippy::single_range_in_vec_init)]
+        let q_dim = self.n_head * head_dim;
+        let kv_dim = self.n_kv_head * head_dim;
+
         let q = qkv
             .clone()
-            .slice([0..1])
-            .reshape([batch_size, self.n_head, seq_len, head_dim]);
-        #[allow(clippy::single_range_in_vec_init)]
+            .slice([0..batch_size, 0..seq_len, 0..q_dim])
+            .reshape([batch_size, seq_len, self.n_head, head_dim])
+            .permute([0, 2, 1, 3]);
         let k = qkv
             .clone()
-            .slice([1..2])
-            .reshape([batch_size, self.n_head, seq_len, head_dim]);
-        #[allow(clippy::single_range_in_vec_init)]
+            .slice([0..batch_size, 0..seq_len, q_dim..(q_dim + kv_dim)])
+            .reshape([batch_size, seq_len, self.n_kv_head, head_dim])
+            .permute([0, 2, 1, 3]);
         let v = qkv
-            .slice([2..3])
-            .reshape([batch_size, self.n_head, seq_len, head_dim]);
+            .slice([
+                0..batch_size,
+                0..seq_len,
+                (q_dim + kv_dim)..(q_dim + 2 * kv_dim),
+            ])
+            .reshape([batch_size, seq_len, self.n_kv_head, head_dim])
+            .permute([0, 2, 1, 3]);
 
         // Apply RoPE to Q and K; V is unchanged
         let q = self.rope.forward(q);
         let k = self.rope.forward(k);
+
+        // Repeat KV heads if n_kv_head < n_head
+        let (k, v) = if self.n_kv_head < self.n_head {
+            let reps = self.n_head / self.n_kv_head;
+            (k.repeat_dim(1, reps), v.repeat_dim(1, reps))
+        } else {
+            (k, v)
+        };
 
         let y = attention(q, k, v, mask, None, AttentionModuleOptions::default());
 
@@ -257,28 +283,32 @@ impl<B: Backend> CausalSelfAttention<B> {
         let head_dim = self.n_embd / self.n_head;
 
         let qkv = self.c_attn.forward(x.clone());
-        let qkv = qkv.reshape([batch_size, seq_len, 3, self.n_head, head_dim]);
-        #[allow(clippy::single_range_in_vec_init)]
-        let qkv = qkv.permute([2, 0, 3, 1, 4]);
+        let q_dim = self.n_head * head_dim;
+        let kv_dim = self.n_kv_head * head_dim;
 
-        #[allow(clippy::single_range_in_vec_init)]
         let q = qkv
             .clone()
-            .slice([0..1])
-            .reshape([batch_size, self.n_head, seq_len, head_dim]);
-        #[allow(clippy::single_range_in_vec_init)]
-        let k = qkv
+            .slice([0..batch_size, 0..seq_len, 0..q_dim])
+            .reshape([batch_size, seq_len, self.n_head, head_dim])
+            .permute([0, 2, 1, 3]);
+        let mut k = qkv
             .clone()
-            .slice([1..2])
-            .reshape([batch_size, self.n_head, seq_len, head_dim]);
-        #[allow(clippy::single_range_in_vec_init)]
+            .slice([0..batch_size, 0..seq_len, q_dim..(q_dim + kv_dim)])
+            .reshape([batch_size, seq_len, self.n_kv_head, head_dim])
+            .permute([0, 2, 1, 3]);
         let mut v = qkv
-            .slice([2..3])
-            .reshape([batch_size, self.n_head, seq_len, head_dim]);
+            .slice([
+                0..batch_size,
+                0..seq_len,
+                (q_dim + kv_dim)..(q_dim + 2 * kv_dim),
+            ])
+            .reshape([batch_size, seq_len, self.n_kv_head, head_dim])
+            .permute([0, 2, 1, 3]);
 
         // Apply RoPE to Q and K before caching — positions are baked in
         let q = self.rope.apply(q, pos_offset);
-        let mut k = self.rope.apply(k, pos_offset);
+        let k_new = self.rope.apply(k, pos_offset);
+        k = k_new;
 
         // Concatenate with cached K, V from previous steps
         if let Some((cached_k, cached_v)) = cache {
@@ -288,7 +318,15 @@ impl<B: Backend> CausalSelfAttention<B> {
 
         let new_cache = (k.clone(), v.clone());
 
-        let y = attention(q, k, v, mask, None, AttentionModuleOptions::default());
+        // Repeat KV heads if n_kv_head < n_head before calling attention
+        let (k_att, v_att) = if self.n_kv_head < self.n_head {
+            let reps = self.n_head / self.n_kv_head;
+            (k.repeat_dim(1, reps), v.repeat_dim(1, reps))
+        } else {
+            (k, v)
+        };
+
+        let y = attention(q, k_att, v_att, mask, None, AttentionModuleOptions::default());
 
         let y = y
             .permute([0, 2, 1, 3])
@@ -551,6 +589,7 @@ mod tests {
             n_layer: 2,
             n_head: 2,
             n_embd: 32,
+            n_kv_head: None,
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
@@ -709,5 +748,78 @@ mod tests {
         let [_, total_len] = output.dims();
         // Should stop at block_size (16), not at 14 + 10 = 24
         assert!(total_len <= config.block_size, "output len {total_len} exceeds block_size {}", config.block_size);
+    }
+
+    #[test]
+    fn test_gqa_attention_shapes() {
+        let device = Default::default();
+        let config = GPTConfig {
+            vocab_size: 100,
+            n_layer: 1,
+            n_head: 4,
+            n_kv_head: Some(2),
+            n_embd: 32,
+            block_size: 16,
+            dropout: 0.0,
+            rope_theta: 10000.0,
+        };
+        let gpt = GPT::<B>::new(&config, &device);
+
+        let batch_size = 2;
+        let seq_len = 10;
+        let input = Tensor::<B, 2, Int>::zeros([batch_size, seq_len], &device);
+
+        let output = gpt.forward(input);
+        let [b, s, v] = output.dims();
+
+        assert_eq!(b, batch_size);
+        assert_eq!(s, seq_len);
+        assert_eq!(v, config.vocab_size);
+    }
+
+    #[test]
+    fn test_gqa_kv_cache_equivalence() {
+        let device = Default::default();
+        let config = GPTConfig {
+            vocab_size: 100,
+            n_layer: 1,
+            n_head: 4,
+            n_kv_head: Some(2),
+            n_embd: 32,
+            block_size: 16,
+            dropout: 0.0,
+            rope_theta: 10000.0,
+        };
+        let gpt = GPT::<B>::new(&config, &device);
+
+        let batch_size = 1;
+        let prompt_len = 5;
+        let prompt = Tensor::<B, 1, Int>::arange(0..prompt_len as i64, &device)
+            .reshape([batch_size, prompt_len]);
+
+        // 1. Full forward pass
+        let full_logits = gpt.forward(prompt.clone());
+        let expected_logits = full_logits.slice([0..1, prompt_len - 1..prompt_len]);
+
+        // 2. Incremental KV cache pass
+        let context = prompt.clone().slice([0..1, 0..prompt_len - 1]);
+        let (_, cache) = gpt.forward_cached(context, None);
+
+        // Verify shape of KV cache: it must store exactly n_kv_head heads
+        let (cached_k, _) = &cache.layers[0];
+        let [_, cached_heads, _, _] = cached_k.dims();
+        assert_eq!(cached_heads, 2, "KV cache should store n_kv_head heads");
+
+        let last_token = prompt.clone().slice([0..1, prompt_len - 1..prompt_len]);
+        let (cached_logits, _) = gpt.forward_cached(last_token, Some(cache));
+
+        let diff = (expected_logits - cached_logits).abs().sum();
+        let diff_val = diff.into_scalar();
+
+        assert!(
+            diff_val < 1e-4,
+            "GQA KV cache logits differ from full forward pass: {}",
+            diff_val
+        );
     }
 }

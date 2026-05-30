@@ -31,25 +31,14 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     #[config(default = 4)]
     pub num_workers: usize,
-    #[config(default = 1337)]
-    pub seed: u64,
     /// Peak learning rate (also the warmup target).
     #[config(default = 1e-3)]
     pub learning_rate: f64,
-    /// Minimum LR at the end of cosine decay. nanoGPT default: lr/10.
-    #[config(default = 1e-4)]
-    pub min_lr: f64,
     /// Linear warmup steps. 0 = no warmup.
     #[config(default = 100)]
     pub warmup_iters: usize,
     #[config(default = 10)]
     pub num_epochs: usize,
-    /// AdamW beta2. nanoGPT uses 0.95 (default Burn: 0.999).
-    #[config(default = 0.95)]
-    pub beta2: f64,
-    /// AdamW weight decay. nanoGPT uses 0.1 (default Burn: 1e-4).
-    #[config(default = 0.1)]
-    pub weight_decay: f64,
     /// 0 = full dataset; positive value caps training items (smoke tests).
     #[config(default = 0)]
     pub max_train_items: usize,
@@ -214,29 +203,30 @@ pub fn run_training<B: AutodiffBackend>(
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
         .batch_size(training_config.batch_size)
-        .shuffle(training_config.seed)
+        .shuffle(1337)
         .num_workers(training_config.num_workers)
         .build(train_dataset);
 
     let dataloader_val = DataLoaderBuilder::new(batcher_val)
         .batch_size(training_config.batch_size)
-        .shuffle(training_config.seed)
+        .shuffle(1337)
         .num_workers(training_config.num_workers)
         .build(val_dataset);
 
     // --- Optimizer (nanoGPT hyperparameters) ---
     let optim = AdamWConfig::new()
         .with_beta_1(0.9)
-        .with_beta_2(training_config.beta2 as f32)
-        .with_weight_decay(training_config.weight_decay as f32)
+        .with_beta_2(0.95)
+        .with_weight_decay(0.1)
         .with_epsilon(1e-8)
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
 
     // --- LR scheduler: linear warmup → cosine decay ---
+    let min_lr = training_config.learning_rate / 10.0;
     let lr_scheduler = WarmupCosineScheduler::new(
         training_config.learning_rate,
-        training_config.min_lr,
+        min_lr,
         training_config.warmup_iters,
         total_iters.max(1),
     );

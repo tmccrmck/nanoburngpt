@@ -40,7 +40,10 @@ Options:
   --num-workers <N>       Dataloader workers            [default: 4]
   --learning-rate <F>     Peak learning rate            [default: 0.001]
   --num-epochs <N>        Training epochs               [default: 10]
+  --warmup-iters <N>      Linear warmup steps           [default: 100]
   --max-train-items <N>   Cap dataset size (0=full)     [default: 0]
+  --grad-accum-steps <N>  Gradient accumulation steps   [default: 1]
+  --amp                   Enable mixed precision (f16)
 ```
 
 Saves `artifacts/model_final.mpk` and `artifacts/config.json` on completion.

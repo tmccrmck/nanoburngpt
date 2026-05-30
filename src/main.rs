@@ -60,27 +60,15 @@ enum Commands {
         /// Number of dataloader workers
         #[arg(long, default_value_t = 4)]
         num_workers: usize,
-        /// Random seed
-        #[arg(long, default_value_t = 1337)]
-        seed: u64,
         /// Learning rate
         #[arg(long, default_value_t = 1e-3)]
         learning_rate: f64,
         /// Number of training epochs
         #[arg(long, default_value_t = 10)]
         num_epochs: usize,
-        /// Minimum LR at end of cosine decay (default: lr/10)
-        #[arg(long, default_value_t = 1e-4)]
-        min_lr: f64,
         /// Warmup steps before cosine decay (0 = no warmup)
         #[arg(long, default_value_t = 100)]
         warmup_iters: usize,
-        /// AdamW beta2 (nanoGPT: 0.95)
-        #[arg(long, default_value_t = 0.95)]
-        beta2: f64,
-        /// AdamW weight decay (nanoGPT: 0.1)
-        #[arg(long, default_value_t = 0.1)]
-        weight_decay: f64,
         /// Cap training items (0 = use full dataset; useful for smoke tests)
         #[arg(long, default_value_t = 0)]
         max_train_items: usize,
@@ -133,13 +121,9 @@ where
             dropout,
             batch_size,
             num_workers,
-            seed,
             learning_rate,
             num_epochs,
-            min_lr,
             warmup_iters,
-            beta2,
-            weight_decay,
             max_train_items,
             rope_theta,
             amp,
@@ -167,12 +151,8 @@ where
             let training_config = TrainingConfig {
                 batch_size,
                 num_workers,
-                seed,
                 learning_rate,
-                min_lr,
                 warmup_iters,
-                beta2,
-                weight_decay,
                 num_epochs,
                 max_train_items,
                 amp,

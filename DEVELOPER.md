@@ -73,14 +73,15 @@ Burn's built-in `ComposedLrScheduler` combines schedulers in **parallel** (multi
 
 ## AdamW Hyperparameters
 
-Defaults match nanoGPT:
+NanoGPT defaults, hardcoded (not configurable via CLI):
 
-| Param          | nanoGPT | Burn default | Our default |
-|----------------|---------|--------------|-------------|
-| `beta1`        | 0.9     | 0.9          | 0.9         |
-| `beta2`        | 0.95    | 0.999        | 0.95        |
-| `epsilon`      | 1e-8    | 1e-5         | 1e-8        |
-| `weight_decay` | 0.1     | 1e-4         | 0.1         |
+| Param          | Value |
+|----------------|-------|
+| `beta1`        | 0.9   |
+| `beta2`        | 0.95  |
+| `epsilon`      | 1e-8  |
+| `weight_decay` | 0.1   |
+| Gradient clip  | norm 1.0 |
 
 ## Key Constraints
 

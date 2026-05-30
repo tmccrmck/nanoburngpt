@@ -103,8 +103,6 @@ The top-level model. Holds:
 - `token_embedding: Embedding` — maps token ID → `n_embd`-dim vector
 - `blocks: Vec<Block>` — the transformer stack
 - `ln_f: LayerNorm` — final layer norm before output projection
-- `causal_mask: Tensor<B, 4, Bool>` — pre-computed causal mask (no gradient)
-- `rope_cos` / `rope_sin: Tensor<B, 2>` — pre-computed RoPE frequency tables (no gradient)
 
 **Weight tying:** there is no separate `lm_head` linear layer. The output projection reuses `token_embedding.weight` transposed:
 
@@ -134,7 +132,7 @@ Q, K, V = split(Linear(x, (n_head + 2*n_kv_head) * head_dim))  # fused QKV proje
 Q, K = apply_rope(Q, K, cos, sin)                               # Rotary Position Embeddings
 K = repeat_dim(K, n_head/n_kv_head) if GQA                     # repeat KV heads if needed
 V = repeat_dim(V, n_head/n_kv_head) if GQA
-y = attention(Q, K, V, causal_mask)                             # fused scaled dot-product attention
+y = attention(Q, K, V, mask=None, attn_bias=None, opts)         # fused scaled dot-product attention
 y = Linear(y, n_embd)                                           # output projection
 ```
 
@@ -144,13 +142,13 @@ Rotary Position Embeddings (RoPE) are applied to Q and K *before* caching, so ca
 
 The `attention()` kernel handles `softmax(QK^T / sqrt(d_k)) * V` and causal masking internally. On CUDA backends this may use an optimized kernel; on wgpu it uses a standard fused implementation. Attention dropout is not supported by this kernel (residual dropout is still applied after the output projection).
 
-**Causal mask:** a boolean tensor (`true` = masked) pre-computed once in `GPT::new` at the full `block_size × block_size` and sliced to `seq_len` in `forward`. This avoids recreating the mask on every step.
+**Causal masking:** handled natively by the attention kernel via `is_causal: true` in `AttentionModuleOptions`. This tells the backend to apply autoregressive masking internally, enabling optimized kernel paths (e.g. flash attention with causal mode). No explicit boolean mask tensor is constructed.
 
 **Heads:** each of `n_head` heads operates on a `head_dim = n_embd / n_head` subspace independently. Results are concatenated before the output projection.
 
 ### MLP
 
-A two-layer feed-forward network with GELU activation and a 4× hidden dimension expansion:
+A two-layer feed-forward network with Squared ReLU activation and a 4× hidden dimension expansion:
 
 ```
 x → Linear(n_embd → 4*n_embd) → GELU → Linear(4*n_embd → n_embd) → Dropout
@@ -240,7 +238,7 @@ for _ in 0..max_new_tokens:
 
 **Cache structure:** `KVCache` holds a `Vec<(K, V)>` per layer, where K and V have shape `[batch, n_head, cached_seq, head_dim]`. Each decode step concatenates the new token's K/V with the cached tensors along the sequence dimension.
 
-**Masking:** during prefill (multi-token), the pre-computed causal mask is applied. During single-token decode steps, no mask is needed — the new token naturally attends to all cached positions plus itself.
+**Masking:** handled natively by the attention kernel via `is_causal: true`. During single-token decode steps, `is_causal: true` with seq_len=1 is a no-op — no explicit mask tensor is ever created.
 
 **Position tracking:** RoPE tables are sliced at the correct absolute position offset derived from the cache length (`cache.layers[0].K.dims()[2]`), so new tokens receive the correct positional encoding without re-encoding the full sequence.
 
@@ -248,9 +246,9 @@ for _ in 0..max_new_tokens:
 
 ### Sampling
 
-Temperature-scaled multinomial sampling with optional top-k and top-p (nucleus) filtering. At `temperature=0`, greedy (argmax) is used instead.
+Temperature-scaled categorical sampling with optional top-k and top-p (nucleus) filtering. At `temperature=0`, greedy (argmax) is used instead.
 
-When only top-k is active (no top-p), filtering is done on-GPU via `topk_with_indices` + softmax, transferring only `batch × top_k` values to CPU. The general case (top-p nucleus sampling) falls back to full CPU transfer via `into_data()` since `rand::WeightedIndex` operates on CPU — acceptable overhead for batch=1 inference.
+When only top-k is active (no top-p), the full path runs on GPU via `topk_with_indices` → `softmax` → `tensor.categorical(1)`. When no filtering is active, the full softmax → `tensor.categorical(1)` path also stays on GPU. Only top-p or combined filtering falls back to CPU using `WeightedIndex` — acceptable overhead for batch=1 inference.
 
 ---
 

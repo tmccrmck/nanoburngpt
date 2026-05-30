@@ -371,6 +371,7 @@ mod tests {
             block_size,
             dropout: 0.0,
             rope_theta: 10000.0,
+            softcap: None,
         };
         let mut model = GPT::<B>::new(&config, &device);
 

@@ -7,7 +7,7 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, LayerNorm,
         LayerNormConfig, Linear, LinearConfig, RotaryEncoding, RotaryEncodingConfig,
     },
-    tensor::{activation, backend::Backend, Bool, Int, Tensor},
+    tensor::{activation, backend::Backend, Int, Tensor},
 };
 use burn::prelude::ToElement;
 use rand::distr::{Distribution, weighted::WeightedIndex};
@@ -44,49 +44,38 @@ fn sample_token<B: Backend>(
     batch: usize,
     vocab: usize,
     device: &B::Device,
-    rng: &mut impl rand::Rng,
 ) -> Tensor<B, 2, Int> {
     if params.temperature < 1e-6 {
         logits.clone().argmax(1).unsqueeze::<2>()
     } else {
         let logits = logits.clone() / params.temperature;
 
-        // Optimization: if we have top_k but no top_p, do filtering on GPU
+        // Pure top-k (no top-p): fully on GPU
         if params.top_k > 0 && params.top_p >= 1.0 && params.top_k < vocab {
             let (values, indices) = logits.topk_with_indices(params.top_k, 1);
             let probs = activation::softmax(values, 1);
-
-            let probs_data = probs.into_data().convert::<f32>();
-            let indices_data = indices.into_data();
-
-            let probs_f32 = probs_data.as_slice::<f32>().expect("f32 probs");
-            // Convert indices to i32 for sampling logic
-            let indices_i32 = indices_data.convert::<i32>();
-            let indices_slice = indices_i32.as_slice::<i32>().expect("i32 indices");
-
-            let tokens: Vec<i32> = (0..batch)
-                .map(|b| {
-                    let row_probs = &probs_f32[b * params.top_k..(b + 1) * params.top_k];
-                    let row_indices = &indices_slice[b * params.top_k..(b + 1) * params.top_k];
-                    let dist = WeightedIndex::new(row_probs).expect("valid weights");
-                    row_indices[dist.sample(rng)]
-                })
-                .collect();
-
-            return Tensor::<B, 1, Int>::from_ints(tokens.as_slice(), device).unsqueeze::<2>();
+            let sampled = probs.categorical(1);
+            return indices.gather(1, sampled);
         }
 
-        // Fallback for nucleus sampling (top_p) or full distribution
+        // No filtering: fully on GPU
+        if params.top_k == 0 && params.top_p >= 1.0 {
+            let probs = activation::softmax(logits, 1);
+            return probs.categorical(1);
+        }
+
+        // Top-p or combined filtering: keep CPU path
         let probs = activation::softmax(logits, 1);
         let probs_data = probs.into_data().convert::<f32>();
         let probs_f32 = probs_data.as_slice::<f32>().expect("f32 probs");
 
+        let mut rng = rand::rng();
         let tokens: Vec<i32> = (0..batch)
             .map(|b| {
                 let row = &probs_f32[b * vocab..(b + 1) * vocab];
                 let filtered = filter_top_k_p(row, params.top_k, params.top_p);
                 let dist = WeightedIndex::new(&filtered).expect("valid weights");
-                dist.sample(rng) as i32
+                dist.sample(&mut rng) as i32
             })
             .collect();
 
@@ -163,6 +152,9 @@ pub struct GPTConfig {
     /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
     #[config(default = 10000.0)]
     pub rope_theta: f64,
+    /// Logit softcap applied before softmax: softcap * tanh(scores / softcap).
+    /// Used by Gemma-2 and similar models. None = disabled.
+    pub softcap: Option<f64>,
 }
 
 #[derive(Module, Debug)]
@@ -174,6 +166,7 @@ pub struct CausalSelfAttention<B: Backend> {
     n_head: usize,
     n_kv_head: usize,
     n_embd: usize,
+    softcap: Option<f64>,
 }
 
 impl<B: Backend> CausalSelfAttention<B> {
@@ -213,14 +206,11 @@ impl<B: Backend> CausalSelfAttention<B> {
             n_head: config.n_head,
             n_kv_head,
             n_embd: config.n_embd,
+            softcap: config.softcap,
         }
     }
 
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 4, Bool>>,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
 
@@ -259,7 +249,14 @@ impl<B: Backend> CausalSelfAttention<B> {
             (k, v)
         };
 
-        let y = attention(q, k, v, mask, None, AttentionModuleOptions::default());
+        let y = attention(
+            q, k, v, None, None,
+            AttentionModuleOptions {
+                softcap: self.softcap,
+                is_causal: true,
+                ..Default::default()
+            },
+        );
 
         let y = y
             .permute([0, 2, 1, 3])
@@ -276,7 +273,6 @@ impl<B: Backend> CausalSelfAttention<B> {
         &self,
         x: Tensor<B, 3>,
         cache: Option<LayerKV<B>>,
-        mask: Option<Tensor<B, 4, Bool>>,
         pos_offset: usize,
     ) -> (Tensor<B, 3>, LayerKV<B>) {
         let [batch_size, seq_len, _] = x.dims();
@@ -326,7 +322,14 @@ impl<B: Backend> CausalSelfAttention<B> {
             (k, v)
         };
 
-        let y = attention(q, k_att, v_att, mask, None, AttentionModuleOptions::default());
+        let y = attention(
+            q, k_att, v_att, None, None,
+            AttentionModuleOptions {
+                softcap: self.softcap,
+                is_causal: true,
+                ..Default::default()
+            },
+        );
 
         let y = y
             .permute([0, 2, 1, 3])
@@ -368,7 +371,7 @@ impl<B: Backend> MLP<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let x = self.c_fc.forward(x);
-        let x = activation::gelu(x);
+        let x = activation::relu(x).square();
         let x = self.c_proj.forward(x);
         self.dropout.forward(x)
     }
@@ -392,12 +395,8 @@ impl<B: Backend> Block<B> {
         }
     }
 
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 4, Bool>>,
-    ) -> Tensor<B, 3> {
-        let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()), mask);
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()));
         x.clone() + self.mlp.forward(self.ln_2.forward(x))
     }
 
@@ -405,12 +404,11 @@ impl<B: Backend> Block<B> {
         &self,
         x: Tensor<B, 3>,
         cache: Option<LayerKV<B>>,
-        mask: Option<Tensor<B, 4, Bool>>,
         pos_offset: usize,
     ) -> (Tensor<B, 3>, LayerKV<B>) {
         let (attn_out, new_cache) =
             self.attn
-                .forward_cached(self.ln_1.forward(x.clone()), cache, mask, pos_offset);
+                .forward_cached(self.ln_1.forward(x.clone()), cache, pos_offset);
         let x = x + attn_out;
         let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
         (x, new_cache)
@@ -422,9 +420,6 @@ pub struct GPT<B: Backend> {
     token_embedding: Embedding<B>,
     blocks: Vec<Block<B>>,
     ln_f: LayerNorm<B>,
-    // Pre-computed causal mask [1, 1, block_size, block_size] — created once, sliced in forward.
-    // Stored as a raw Tensor (not Param) so it's not a learnable parameter.
-    causal_mask: Tensor<B, 4, Bool>,
 }
 
 impl<B: Backend> GPT<B> {
@@ -437,18 +432,10 @@ impl<B: Backend> GPT<B> {
 
         let ln_f = LayerNormConfig::new(config.n_embd).init(device);
 
-        // Pre-compute the full causal mask once as a boolean tensor (true = masked).
-        let bs = config.block_size;
-        let causal_mask = Tensor::<B, 2>::ones([bs, bs], device)
-            .tril(0)
-            .equal_elem(0.0)
-            .reshape([1, 1, bs, bs]);
-
         Self {
             token_embedding,
             blocks,
             ln_f,
-            causal_mask,
         }
     }
 
@@ -458,14 +445,8 @@ impl<B: Backend> GPT<B> {
         // Token embeddings only — position is handled by RoPE inside attention
         let mut x = self.token_embedding.forward(idx);
 
-        // Slice the pre-computed causal mask to the current sequence length
-        let mask = self
-            .causal_mask
-            .clone()
-            .slice([0..1, 0..1, 0..seq_len, 0..seq_len]);
-
         for block in &self.blocks {
-            x = block.forward(x, Some(mask.clone()));
+            x = block.forward(x);
         }
 
         let x = self.ln_f.forward(x);
@@ -479,8 +460,8 @@ impl<B: Backend> GPT<B> {
     }
 
     /// Forward pass that builds/extends a KV cache for incremental decoding.
-    /// - `cache = None`: prefill (process full sequence with causal mask, return initial cache)
-    /// - `cache = Some(...)`: decode (process new tokens, no mask needed for single-token steps)
+    /// - `cache = None`: prefill (process full sequence, return initial cache)
+    /// - `cache = Some(...)`: decode (process new tokens)
     pub fn forward_cached(
         &self,
         idx: Tensor<B, 2, Int>,
@@ -494,22 +475,11 @@ impl<B: Backend> GPT<B> {
         // Token embeddings only — position handled by RoPE
         let mut x = self.token_embedding.forward(idx);
 
-        // Causal mask only needed during prefill (multi-token); single-token decode needs no mask
-        let mask = if cache.is_none() && seq_len > 1 {
-            Some(
-                self.causal_mask
-                    .clone()
-                    .slice([0..1, 0..1, 0..seq_len, 0..seq_len]),
-            )
-        } else {
-            None
-        };
-
         let mut new_layers = Vec::with_capacity(self.blocks.len());
         for (i, block) in self.blocks.iter().enumerate() {
             let layer_cache = cache.as_ref().map(|c| c.layers[i].clone());
             let (out, layer_kv) =
-                block.forward_cached(x, layer_cache, mask.clone(), pos_offset);
+                block.forward_cached(x, layer_cache, pos_offset);
             x = out;
             new_layers.push(layer_kv);
         }
@@ -537,7 +507,6 @@ impl<B: Backend> GPT<B> {
         block_size: usize,
         mut on_token: impl FnMut(i32),
     ) -> Tensor<B, 2, Int> {
-        let mut rng = rand::rng();
         let [batch, _] = idx.dims();
         let device = idx.device();
 
@@ -552,7 +521,7 @@ impl<B: Backend> GPT<B> {
                 .slice([0..batch, len - 1..len, 0..vocab])
                 .reshape([batch, vocab]);
 
-            let idx_next = sample_token::<B>(&logits, sampling, batch, vocab, &device, &mut rng);
+            let idx_next = sample_token::<B>(&logits, sampling, batch, vocab, &device);
 
             // Stream the token to the caller
             let token_id = idx_next.clone().into_scalar().to_i32();
@@ -593,6 +562,7 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
+            softcap: None,
         }
     }
 
@@ -762,6 +732,7 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
+            softcap: None,
         };
         let gpt = GPT::<B>::new(&config, &device);
 
@@ -789,6 +760,7 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
+            softcap: None,
         };
         let gpt = GPT::<B>::new(&config, &device);
 

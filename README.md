@@ -33,6 +33,7 @@ Options:
                             shakespeare, wikitext103
   --n-layer <N>           Override preset: transformer layers
   --n-head <N>            Override preset: attention heads
+  --n-kv-head <N>         Override preset: key/value heads (GQA)
   --n-embd <N>            Override preset: embedding dimension
   --block-size <N>        Override preset: context window size
   --dropout <F>           Dropout probability           [default: 0.2]
@@ -43,6 +44,8 @@ Options:
   --warmup-iters <N>      Linear warmup steps           [default: 100]
   --max-train-items <N>   Cap dataset size (0=full)     [default: 0]
   --grad-accum-steps <N>  Gradient accumulation steps   [default: 1]
+  --rope-theta <F>        RoPE frequency base           [default: 10000.0]
+  --softcap <F>           Logit softcap (Gemma-2 style) [default: disabled]
   --amp                   Enable mixed precision (f16)
 ```
 
@@ -59,6 +62,8 @@ Options:
   --max-tokens <N>        Tokens to generate            [default: 500]
   --temperature <F>       Sampling temperature          [default: 0.8]
                           (0 = greedy, higher = more random)
+  --top-k <N>             Top-k sampling (0 = disabled) [default: 0]
+  --top-p <F>             Nucleus sampling (1.0 = all)  [default: 1.0]
 ```
 
 ## Model Presets
@@ -117,13 +122,14 @@ The `run_cloud.sh` script is the default entry point for the Docker image. It de
 
 Standard decoder-only Transformer (nanoGPT style):
 
-- **Tokenizer**: GPT-2 BPE via tiktoken-rs (r50k_base, 50257 vocab)
-- **Embedding**: token + positional, weight-tied to output projection
+- **Tokenizer**: GPT-2 BPE via tiktoken-rs (r50k_base, 50257 vocab); BOS token prepended
+- **Embedding**: token embedding only, weight-tied to output projection; RoPE replaces learned position embeddings
 - **Blocks**: `n_layer` × (causal self-attention + MLP), pre-norm with LayerNorm
-- **Attention**: multi-head causal self-attention with dropout
+- **Attention**: multi-head causal self-attention with grouped-query attention (GQA), RoPE, optional softcap; dropout-free fused kernel
+- **MLP**: `n_embd → 4·n_embd → n_embd` with Squared ReLU activation
 - **Init**: Normal(0, 0.02) weights; scaled residual init (0.02/√(2·n_layer))
-- **Optimizer**: AdamW with gradient clipping (norm 1.0) and cosine LR decay
-- **Generation**: temperature-scaled multinomial sampling (or greedy at temperature=0)
+- **Optimizer**: AdamW with gradient clipping (norm 1.0), weight decay 0.1, cosine LR + linear warmup
+- **Generation**: GPU-accelerated categorical sampling with top-k and top-p; KV-cached autoregressive decoding
 
 ## Project Layout
 

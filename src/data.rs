@@ -126,6 +126,8 @@ impl BpeTokenizer {
             .unwrap_or_default()
     }
 
+    /// `<|endoftext|>` — GPT-2's BOS/EOS token.
+    pub const BOS_TOKEN: usize = 50256;
     pub const VOCAB_SIZE: usize = 50257;
 }
 
@@ -133,11 +135,13 @@ impl BpeTokenizer {
 // Generic text-file loader (dataset-agnostic)
 // ---------------------------------------------------------------------------
 
-/// Load a plain-text file, tokenize with BPE, split 90/10 train/val.
+/// Load a plain-text file, tokenize with BPE, prepend BOS token, split 90/10 train/val.
 pub fn load_text(path: &Path, block_size: usize) -> anyhow::Result<(TextDataset, TextDataset)> {
     let text = std::fs::read_to_string(path)?;
     let tokenizer = BpeTokenizer::new();
-    let data = tokenizer.encode(&text);
+    let mut data = tokenizer.encode(&text);
+    // Prepend BOS token (<|endoftext|> = 50256) so the model learns sequence-start boundaries.
+    data.insert(0, BpeTokenizer::BOS_TOKEN);
 
     let n = data.len();
     let split = (n as f64 * 0.9) as usize;

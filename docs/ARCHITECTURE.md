@@ -1,6 +1,6 @@
 # Architecture
 
-NanoBurnGPT is a decoder-only Transformer (GPT-2 style) implemented in Rust using the [Burn 0.20](https://burn.dev/) deep learning framework.
+NanoBurnGPT is a decoder-only Transformer (GPT-2 style) implemented in Rust using the [Burn 0.21](https://burn.dev/) deep learning framework.
 
 ---
 
@@ -18,10 +18,9 @@ TextDataset           sliding window sequences of length block_size
  ▼
 GPT (forward)
  ├── TokenEmbedding    [vocab_size, n_embd]
- ├── PositionEmbedding [block_size, n_embd]
  └── Block × n_layer
       ├── LayerNorm
-      ├── CausalSelfAttention
+      ├── CausalSelfAttention  ← RoPE applied to Q, K; optional GQA
       ├── LayerNorm
       └── MLP
  └── LayerNorm (final)
@@ -86,12 +85,14 @@ Each training example is a pair `(input[0..block_size], target[1..block_size+1])
 
 ```rust
 pub struct GPTConfig {
-    pub vocab_size: usize,   // always 50257 (BPE)
-    pub n_layer:    usize,   // number of transformer blocks
-    pub n_head:     usize,   // attention heads per block
-    pub n_embd:     usize,   // embedding / residual stream dimension
-    pub block_size: usize,   // context window (max sequence length)
+    pub vocab_size: usize,        // always 50257 (BPE)
+    pub n_layer:    usize,        // number of transformer blocks
+    pub n_head:     usize,        // attention heads per block
+    pub n_kv_head:  Option<usize>,// KV heads for GQA (None = MHA, same as n_head)
+    pub n_embd:     usize,        // embedding / residual stream dimension
+    pub block_size: usize,        // context window (max sequence length)
     pub dropout:    f64,
+    pub rope_theta: f64,          // RoPE frequency base (default 10000.0)
 }
 ```
 
@@ -100,9 +101,10 @@ pub struct GPTConfig {
 The top-level model. Holds:
 
 - `token_embedding: Embedding` — maps token ID → `n_embd`-dim vector
-- `position_embedding: Embedding` — learned position encoding for each slot 0..block_size
 - `blocks: Vec<Block>` — the transformer stack
 - `ln_f: LayerNorm` — final layer norm before output projection
+- `causal_mask: Tensor<B, 4, Bool>` — pre-computed causal mask (no gradient)
+- `rope_cos` / `rope_sin: Tensor<B, 2>` — pre-computed RoPE frequency tables (no gradient)
 
 **Weight tying:** there is no separate `lm_head` linear layer. The output projection reuses `token_embedding.weight` transposed:
 
@@ -125,13 +127,20 @@ Pre-LN (normalizing before the sublayer, not after) is more training-stable than
 
 ### CausalSelfAttention
 
-Multi-head scaled dot-product attention with a causal mask, using Burn's fused SDPA kernel (`burn::tensor::module::attention`).
+Multi-head (or grouped-query) scaled dot-product attention with a causal mask and RoPE, using Burn's fused SDPA kernel (`burn::tensor::module::attention`).
 
 ```
-Q, K, V = split(Linear(x, 3*n_embd))          # fused QKV projection
-y = attention(Q, K, V, causal_mask)            # fused scaled dot-product attention
-y = Linear(y, n_embd)                          # output projection
+Q, K, V = split(Linear(x, (n_head + 2*n_kv_head) * head_dim))  # fused QKV projection
+Q, K = apply_rope(Q, K, cos, sin)                               # Rotary Position Embeddings
+K = repeat_dim(K, n_head/n_kv_head) if GQA                     # repeat KV heads if needed
+V = repeat_dim(V, n_head/n_kv_head) if GQA
+y = attention(Q, K, V, causal_mask)                             # fused scaled dot-product attention
+y = Linear(y, n_embd)                                           # output projection
 ```
+
+When `n_kv_head` is set, only that many key/value heads are computed and stored in the KV cache, reducing memory. They are repeated to match `n_head` before the attention kernel. If `n_kv_head` is `None` (default), standard multi-head attention is used.
+
+Rotary Position Embeddings (RoPE) are applied to Q and K *before* caching, so cached K/V tensors already contain their position information. The frequency base `rope_theta` is configurable (10000.0 = original paper, 100000.0 = extended context).
 
 The `attention()` kernel handles `softmax(QK^T / sqrt(d_k)) * V` and causal masking internally. On CUDA backends this may use an optimized kernel; on wgpu it uses a standard fused implementation. Attention dropout is not supported by this kernel (residual dropout is still applied after the output projection).
 
@@ -233,13 +242,15 @@ for _ in 0..max_new_tokens:
 
 **Masking:** during prefill (multi-token), the pre-computed causal mask is applied. During single-token decode steps, no mask is needed — the new token naturally attends to all cached positions plus itself.
 
-**Position tracking:** the position embedding offset is derived from the cache length (`cache.layers[0].K.dims()[2]`), so new tokens receive the correct positional encoding without re-encoding the full sequence.
+**Position tracking:** RoPE tables are sliced at the correct absolute position offset derived from the cache length (`cache.layers[0].K.dims()[2]`), so new tokens receive the correct positional encoding without re-encoding the full sequence.
 
 **Complexity:** reduces per-step cost from O(seq²) to O(seq) during generation, at the cost of O(n_layer × n_head × seq × head_dim) memory for the cache.
 
 ### Sampling
 
-Temperature-scaled multinomial sampling. At `temperature=0`, greedy (argmax) is used instead. Probabilities are pulled to CPU (`into_data()`) for sampling since `rand::WeightedIndex` operates on CPU — acceptable overhead for batch=1 inference.
+Temperature-scaled multinomial sampling with optional top-k and top-p (nucleus) filtering. At `temperature=0`, greedy (argmax) is used instead.
+
+When only top-k is active (no top-p), filtering is done on-GPU via `topk_with_indices` + softmax, transferring only `batch × top_k` values to CPU. The general case (top-p nucleus sampling) falls back to full CPU transfer via `into_data()` since `rand::WeightedIndex` operates on CPU — acceptable overhead for batch=1 inference.
 
 ---
 
@@ -253,8 +264,9 @@ Selected at compile time via Cargo feature flags:
 |------|---------|--------|
 | `--features wgpu` (default) | Burn wgpu | Metal on macOS, Vulkan/DX12 elsewhere |
 | `--features cuda` | Burn CUDA (via cubecl) | NVIDIA GPUs |
+| `--cpu` flag | Burn Flex (CPU) | Fallback when no GPU |
 
-A `compile_error!` fires if neither feature is enabled. CUDA takes precedence if both are specified.
+A `compile_error!` fires if neither feature is enabled. CUDA takes precedence if both are specified. The `--amp` flag enables f16 mixed precision on supported backends.
 
 ```sh
 # Default (wgpu/Metal on macOS)
@@ -262,6 +274,9 @@ cargo run --release -- train
 
 # CUDA
 cargo run --release --features cuda -- train
+
+# CPU fallback
+cargo run --release -- train --cpu
 ```
 
 ---
@@ -302,9 +317,11 @@ Inference loads `config.json` to reconstruct the architecture, then loads weight
 
 | nanoGPT (Python/PyTorch) | NanoBurnGPT (Rust/Burn) |
 |--------------------------|------------------------|
-| Python + PyTorch | Rust + Burn 0.20 |
+| Python + PyTorch | Rust + Burn 0.21 |
 | Flash Attention (PyTorch SDPA) | Burn's fused SDPA kernel (`burn::tensor::module::attention`) |
 | KV cache for inference | KV cache (`GPT::forward_cached`, `KVCache`) |
 | `torch.compile` | Burn's own graph fusion |
 | CPU multinomial sampling | CPU multinomial via `rand::WeightedIndex` |
-| Top-k / top-p sampling | Temperature-only sampling (no nucleus sampling yet) |
+| Top-k / top-p sampling | Top-k / top-p sampling (with GPU-optimized top-k path) |
+| Learned position embeddings | RoPE (Rotary Position Embeddings, no learned params) |
+| Multi-head attention (MHA) | MHA default; optional GQA via `--n-kv-head` |

@@ -33,17 +33,17 @@ cargo clippy
 ```
 
 ```sh
-# Unit tests (24 tests across data, datasets, presets, train, model)
+# Unit tests (39 tests across data, datasets, presets, train, model)
 cargo test
 ```
 
 ## Architecture
 
-Decoder-only Transformer (nanoGPT style) implemented with [Burn 0.20](https://burn.dev/) and the `wgpu` (Metal) backend.
+Decoder-only Transformer (nanoGPT style) implemented with [Burn 0.21](https://burn.dev/) and the `wgpu` (Metal) backend.
 
 **Data flow:**
 1. `data.rs` — `load_text` reads a pre-downloaded text file, tokenizes with `BpeTokenizer` (tiktoken-rs r50k_base, vocab_size=50257), splits 90/10 into `TextDataset` (train/val), and `TextGenerationBatcher` collates samples into `TextGenerationBatch` (inputs/targets shifted by 1)
-2. `model.rs` — `GPT::forward` runs token+position embeddings → N × `Block` (LayerNorm → `CausalSelfAttention` → LayerNorm → `MLP`) → final LayerNorm → weight-tied output projection. Attention uses Burn's fused SDPA kernel (`burn::tensor::module::attention`). The causal mask is a boolean tensor pre-computed once in `GPT::new` and sliced per forward call. `GPT::generate` uses KV caching via `GPT::forward_cached` — prefills the prompt, then decodes one token at a time reusing cached K/V tensors
+2. `model.rs` — `GPT::forward` runs token embeddings → N × `Block` (LayerNorm → `CausalSelfAttention` with RoPE → LayerNorm → `MLP`) → final LayerNorm → weight-tied output projection. Attention uses Burn's fused SDPA kernel (`burn::tensor::module::attention`). The causal mask is a boolean tensor pre-computed once in `GPT::new` and sliced per forward call. `GPT::generate` uses KV caching via `GPT::forward_cached` — prefills the prompt, then decodes one token at a time reusing cached K/V tensors
 3. `train.rs` — `GPT::forward_classification` flattens `[batch, seq, vocab]` → `[batch*seq, vocab]` for cross-entropy. `run_training` wires together Burn's `Learner::new` + `SupervisedTraining::new(...).launch(learner)`. `WarmupCosineScheduler` implements the nanoGPT LR schedule (Burn's `ComposedLrScheduler` combines in parallel, not sequentially, so a custom impl was required)
 4. `inference.rs` — loads `artifacts/config.json` and `artifacts/model_final.mpk`, creates `BpeTokenizer::new()`, encodes prompt, calls `GPT::generate`, decodes output
 5. `datasets.rs` — `Dataset` enum (Shakespeare, WikiText103); `ensure_downloaded` fetches and preprocesses on first use, caches to `data/<name>/input.txt`
@@ -53,7 +53,7 @@ Decoder-only Transformer (nanoGPT style) implemented with [Burn 0.20](https://bu
 
 **Artifacts** written to `artifacts/` (gitignored): `config.json`, `model_final.mpk`, best-epoch checkpoint, metric CSVs, `experiment.log`.
 
-## Burn 0.20 API
+## Burn 0.21 API
 
 Keep these in mind when modifying training or model code:
 
@@ -78,5 +78,4 @@ Keep these in mind when modifying training or model code:
 ## Known gaps vs nanoGPT
 
 - Multinomial sampling pulls probabilities to CPU (`into_data()`) — fine for batch=1 inference
-- No top-k / top-p (nucleus) sampling — only temperature scaling
 - Tokenizer: always GPT-2 BPE (r50k_base, 50257 vocab) — no char-level fallback

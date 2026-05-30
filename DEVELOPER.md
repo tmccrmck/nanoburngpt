@@ -4,7 +4,7 @@ For AI agents and developers working on this codebase.
 
 ## Goal
 
-Character-level **NanoGPT** (decoder-only Transformer) trained on Tiny Shakespeare, implemented with the **Rust Burn 0.20** deep learning framework and `wgpu` (Metal) backend.
+**NanoGPT** (decoder-only Transformer) trained on Shakespeare or WikiText-103, implemented with the **Rust Burn 0.21** deep learning framework and `wgpu` (Metal) backend.
 
 Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 
@@ -13,11 +13,11 @@ Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 | Component   | Choice                                      |
 |-------------|---------------------------------------------|
 | Language    | Rust (edition 2024)                         |
-| ML framework| [Burn 0.20.1](https://burn.dev/)            |
+| ML framework| [Burn 0.21.0](https://burn.dev/)            |
 | Backend     | `wgpu` (cross-platform GPU, Metal on macOS) |
-| Dataset     | Tiny Shakespeare (character-level)          |
+| Dataset     | Shakespeare / WikiText-103 (BPE tokenized)  |
 | CLI         | `clap`                                      |
-| Config/serde| `serde` + `serde_json`                      |
+| Tokenizer   | `tiktoken-rs` (GPT-2 BPE r50k_base)         |
 | HTTP        | `reqwest` (dataset download)                |
 
 ## Project Structure
@@ -26,7 +26,7 @@ Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 |--------------------|------------------------------------------------------|
 | `src/main.rs`      | CLI entry point (`train` / `generate` subcommands)   |
 | `src/lib.rs`       | Module declarations                                  |
-| `src/data.rs`      | `CharTokenizer`, `TextDataset`, `TextGenerationBatcher` |
+| `src/data.rs`      | `BpeTokenizer`, `TextDataset`, `TextGenerationBatcher` |
 | `src/model.rs`     | `CausalSelfAttention`, `MLP`, `Block`, `GPT`         |
 | `src/train.rs`     | `TrainStep`, `InferenceStep`, `run_training`         |
 | `src/inference.rs` | `generate_text`                                      |
@@ -35,10 +35,10 @@ Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 
 The full pipeline compiles and runs end-to-end:
 
-- `cargo run -- train` downloads data, trains, saves model + tokenizer
+- `cargo run -- train` downloads data, trains, saves model
 - `cargo run -- generate` loads model and generates text
 
-## Burn 0.20 API Notes
+## Burn 0.21 API Notes
 
 Several API changes from older Burn versions were resolved during implementation. Keep these in mind when updating:
 
@@ -85,7 +85,9 @@ Defaults match nanoGPT:
 ## Key Constraints
 
 - `n_embd` must be divisible by `n_head` (determines `head_dim = n_embd / n_head`).
-- Default config (6 layers, 6 heads, 384 embd) trains in ~1–3 min/epoch in release mode on Metal.
+- `head_dim` must be even (RoPE split-half formulation requires it).
+- `n_head` must be a multiple of `n_kv_head` when GQA is used.
+- The `nano` preset (2 layers, 4 heads, 64 embd) trains in seconds per epoch in release mode on Metal.
 
 ## Artifacts
 
@@ -94,7 +96,6 @@ Training writes to `artifacts/` (gitignored):
 ```
 artifacts/
   config.json          GPTConfig (vocab size, architecture)
-  tokenizer.json       CharTokenizer (char↔index mappings)
   model_final.mpk      Final trained weights (CompactRecorder)
   checkpoint/          Per-epoch checkpoints (model, optim, scheduler)
   experiment.log       Training log
@@ -122,4 +123,4 @@ cargo run --release -- generate --prompt "HAMLET:" --temperature 0.8
 
 - [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT)
 - [The Burn Book](https://burn.dev/book/)
-- [Burn API docs](https://docs.rs/burn/0.20.1/burn/)
+- [Burn API docs](https://docs.rs/burn/0.21.0/burn/)

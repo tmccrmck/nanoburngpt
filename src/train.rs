@@ -56,6 +56,9 @@ pub struct TrainingConfig {
     /// Enable mixed precision (AMP)
     #[config(default = false)]
     pub amp: bool,
+    /// Gradient accumulation steps (1 = no accumulation)
+    #[config(default = 1)]
+    pub grad_accum_steps: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +261,7 @@ pub fn run_training<B: AutodiffBackend>(
         .with_file_checkpointer(CompactRecorder::new())
         .with_checkpointing_strategy(strategy)
         .num_epochs(training_config.num_epochs)
+        .grads_accumulation(training_config.grad_accum_steps)
         .summary()
         .launch(learner);
 

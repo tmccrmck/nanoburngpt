@@ -90,6 +90,9 @@ enum Commands {
         /// Enable mixed precision (AMP)
         #[arg(long)]
         amp: bool,
+        /// Gradient accumulation steps (simulates larger batch size with less memory)
+        #[arg(long, default_value_t = 1)]
+        grad_accum_steps: usize,
     },
     Generate {
         #[arg(long, default_value = "artifacts")]
@@ -140,6 +143,7 @@ where
             max_train_items,
             rope_theta,
             amp,
+            grad_accum_steps,
         } => {
             let preset = model
                 .parse::<ModelPreset>()
@@ -172,6 +176,7 @@ where
                 num_epochs,
                 max_train_items,
                 amp,
+                grad_accum_steps,
             };
 
             println!(

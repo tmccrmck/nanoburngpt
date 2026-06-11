@@ -124,7 +124,7 @@ Standard decoder-only Transformer (nanoGPT style):
 
 - **Tokenizer**: GPT-2 BPE via tiktoken-rs (r50k_base, 50257 vocab); BOS token prepended
 - **Embedding**: token embedding only, weight-tied to output projection; RoPE replaces learned position embeddings
-- **Blocks**: `n_layer` × (causal self-attention + MLP), pre-norm with LayerNorm
+- **Blocks**: `n_layer` × (causal self-attention + MLP), pre-norm with RMSNorm
 - **Attention**: multi-head causal self-attention with grouped-query attention (GQA), RoPE, optional softcap; dropout-free fused kernel
 - **MLP**: `n_embd → 4·n_embd → n_embd` with Squared ReLU activation
 - **Init**: Normal(0, 0.02) weights; scaled residual init (0.02/√(2·n_layer))
@@ -138,7 +138,10 @@ src/
   main.rs       CLI entry point
   lib.rs        Module declarations
   data.rs       BPE tokenizer, dataset, batching
-  model.rs      GPT, Transformer blocks, attention
+  model/
+    mod.rs      GPT, Block, MLP, RMSNorm
+    attention.rs CausalSelfAttention, KV cache
+    sampling.rs SamplingParams, sample_token, filter_top_k_p
   train.rs      Training loop (Burn SupervisedTraining)
   inference.rs  Text generation and model loading
   datasets.rs   Dataset registry (download + preprocessing)

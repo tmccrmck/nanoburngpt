@@ -19,11 +19,11 @@ TextDataset           sliding window sequences of length block_size
 GPT (forward)
  ├── TokenEmbedding    [vocab_size, n_embd]
  └── Block × n_layer
-      ├── LayerNorm
-      ├── CausalSelfAttention  ← RoPE applied to Q, K; optional GQA
-      ├── LayerNorm
-      └── MLP
- └── LayerNorm (final)
+  ├── RMSNorm
+  ├── CausalSelfAttention  ← RoPE applied to Q, K; optional GQA
+  ├── RMSNorm
+  └── MLP
+  └── RMSNorm (final)
  └── Logits            x @ token_embedding.weight.T  (weight-tied)
  │
  ▼
@@ -79,7 +79,7 @@ Each training example is a pair `(input[0..block_size], target[1..block_size+1])
 
 ## Model
 
-**File:** `src/model.rs`
+**File:** `src/model/mod.rs`, `src/model/attention.rs`, `src/model/sampling.rs`
 
 ### GPTConfig
 
@@ -93,6 +93,8 @@ pub struct GPTConfig {
     pub block_size: usize,        // context window (max sequence length)
     pub dropout:    f64,
     pub rope_theta: f64,          // RoPE frequency base (default 10000.0)
+    pub softcap:    Option<f64>,  // logit softcap (Gemma-2 style)
+    pub share_kv:   bool,         // Q-K=V projection sharing (ICML 2026)
 }
 ```
 
@@ -102,7 +104,7 @@ The top-level model. Holds:
 
 - `token_embedding: Embedding` — maps token ID → `n_embd`-dim vector
 - `blocks: Vec<Block>` — the transformer stack
-- `ln_f: LayerNorm` — final layer norm before output projection
+- `ln_f: RMSNorm` — final normalization before output projection
 
 **Weight tying:** there is no separate `lm_head` linear layer. The output projection reuses `token_embedding.weight` transposed:
 
@@ -117,8 +119,8 @@ This halves the parameter count for the embedding/output pair and is standard pr
 Each block is a Pre-LN (pre-normalization) transformer block:
 
 ```
-x = x + Attention(LayerNorm(x))
-x = x + MLP(LayerNorm(x))
+x = x + Attention(RMSNorm(x))
+x = x + MLP(RMSNorm(x))
 ```
 
 Pre-LN (normalizing before the sublayer, not after) is more training-stable than the original "Post-LN" GPT-1 design.
@@ -128,7 +130,7 @@ Pre-LN (normalizing before the sublayer, not after) is more training-stable than
 Multi-head (or grouped-query) scaled dot-product attention with a causal mask and RoPE, using Burn's fused SDPA kernel (`burn::tensor::module::attention`).
 
 ```
-Q, K, V = split(Linear(x, (n_head + 2*n_kv_head) * head_dim))  # fused QKV projection
+Q, K, V = split(Linear(x, (n_head + n_kv_projs * n_kv_head) * head_dim))  # fused QKV projection (n_kv_projs=1 for Q-K=V, 2 for standard)
 Q, K = apply_rope(Q, K, cos, sin)                               # Rotary Position Embeddings
 K = repeat_dim(K, n_head/n_kv_head) if GQA                     # repeat KV heads if needed
 V = repeat_dim(V, n_head/n_kv_head) if GQA
@@ -151,7 +153,7 @@ The `attention()` kernel handles `softmax(QK^T / sqrt(d_k)) * V` and causal mask
 A two-layer feed-forward network with Squared ReLU activation and a 4× hidden dimension expansion:
 
 ```
-x → Linear(n_embd → 4*n_embd) → GELU → Linear(4*n_embd → n_embd) → Dropout
+x → Linear(n_embd → 4*n_embd) → ReLU → square → Linear(4*n_embd → n_embd) → Dropout
 ```
 
 ### Weight Initialization
@@ -319,7 +321,7 @@ Inference loads `config.json` to reconstruct the architecture, then loads weight
 | Flash Attention (PyTorch SDPA) | Burn's fused SDPA kernel (`burn::tensor::module::attention`) |
 | KV cache for inference | KV cache (`GPT::forward_cached`, `KVCache`) |
 | `torch.compile` | Burn's own graph fusion |
-| CPU multinomial sampling | CPU multinomial via `rand::WeightedIndex` |
-| Top-k / top-p sampling | Top-k / top-p sampling (with GPU-optimized top-k path) |
+| CPU multinomial sampling | GPU categorical sampling (`tensor.categorical(1)`) |
+| Top-k / top-p sampling | Top-k / top-p sampling (GPU top-k path; CPU fallback only for top-p) |
 | Learned position embeddings | RoPE (Rotary Position Embeddings, no learned params) |
 | Multi-head attention (MHA) | MHA default; optional GQA via `--n-kv-head` |

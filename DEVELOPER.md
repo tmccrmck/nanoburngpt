@@ -27,7 +27,9 @@ Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 | `src/main.rs`      | CLI entry point (`train` / `generate` subcommands)   |
 | `src/lib.rs`       | Module declarations                                  |
 | `src/data.rs`      | `BpeTokenizer`, `TextDataset`, `TextGenerationBatcher` |
-| `src/model.rs`     | `CausalSelfAttention`, `MLP`, `Block`, `GPT`         |
+| `src/model/mod.rs`      | `GPTConfig`, `GPT`, `Block`, `MLP`, `RMSNorm`                |
+| `src/model/attention.rs`| `CausalSelfAttention`, `KVCache`, `LayerKV`                  |
+| `src/model/sampling.rs` | `SamplingParams`, `sample_token`, `filter_top_k_p`           |
 | `src/train.rs`     | `TrainStep`, `InferenceStep`, `run_training`         |
 | `src/inference.rs` | `generate_text`                                      |
 

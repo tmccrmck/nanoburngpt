@@ -1,37 +1,37 @@
 use burn::tensor::module::attention;
-use burn::tensor::backend::ops::AttentionModuleOptions;
+use burn::tensor::ops::AttentionModuleOptions;
 use burn::{
     module::Module,
     nn::{
-        Dropout, DropoutConfig, Initializer, Linear, LinearConfig,
-        RotaryEncoding, RotaryEncodingConfig,
+        Dropout, DropoutConfig, Initializer, Linear, LinearConfig, RotaryEncoding,
+        RotaryEncodingConfig,
     },
-    tensor::{backend::Backend, Tensor},
+    prelude::*,
 };
 use super::GPTConfig;
 
 /// Per-layer cached K and V tensors: [batch, n_head, cached_seq, head_dim].
-pub type LayerKV<B> = (Tensor<B, 4>, Tensor<B, 4>);
+pub type LayerKV = (Tensor<4>, Tensor<4>);
 
 /// KV cache across all layers. `layers[i]` holds (K, V) for block `i`.
 #[derive(Clone, Debug)]
-pub struct KVCache<B: Backend> {
-    pub layers: Vec<LayerKV<B>>,
+pub struct KVCache {
+    pub layers: Vec<LayerKV>,
 }
 
 #[derive(Module, Debug)]
-pub struct CausalSelfAttention<B: Backend> {
-    c_attn: Linear<B>,
-    c_proj: Linear<B>,
+pub struct CausalSelfAttention {
+    c_attn: Linear,
+    c_proj: Linear,
     resid_dropout: Dropout,
-    rope: RotaryEncoding<B>,
+    rope: RotaryEncoding,
     n_head: usize,
     n_kv_head: usize,
     n_embd: usize,
 }
 
-impl<B: Backend> CausalSelfAttention<B> {
-    pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
+impl CausalSelfAttention {
+    pub fn new(config: &GPTConfig, device: &Device) -> Self {
         let n_kv_head = config.n_kv_head.unwrap_or(config.n_head);
         assert_eq!(
             config.n_head % n_kv_head,
@@ -70,23 +70,29 @@ impl<B: Backend> CausalSelfAttention<B> {
     }
 
     #[inline]
-    fn split_qkv(&self, x: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>, usize, usize, usize) {
+    fn split_qkv(&self, x: Tensor<3>) -> (Tensor<4>, Tensor<4>, Tensor<4>, usize, usize, usize) {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
         let q_dim = self.n_head * head_dim;
         let kv_dim = self.n_kv_head * head_dim;
 
         let qkv = self.c_attn.forward(x);
-        let q = qkv.clone()
+        let q = qkv
+            .clone()
             .slice([0..batch_size, 0..seq_len, 0..q_dim])
             .reshape([batch_size, seq_len, self.n_head, head_dim])
             .permute([0, 2, 1, 3]);
-        let k = qkv.clone()
+        let k = qkv
+            .clone()
             .slice([0..batch_size, 0..seq_len, q_dim..(q_dim + kv_dim)])
             .reshape([batch_size, seq_len, self.n_kv_head, head_dim])
             .permute([0, 2, 1, 3]);
         let v = qkv
-            .slice([0..batch_size, 0..seq_len, (q_dim + kv_dim)..(q_dim + 2 * kv_dim)])
+            .slice([
+                0..batch_size,
+                0..seq_len,
+                (q_dim + kv_dim)..(q_dim + 2 * kv_dim),
+            ])
             .reshape([batch_size, seq_len, self.n_kv_head, head_dim])
             .permute([0, 2, 1, 3]);
 
@@ -94,7 +100,7 @@ impl<B: Backend> CausalSelfAttention<B> {
     }
 
     #[inline]
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let (q, k, v, batch_size, seq_len, _) = self.split_qkv(x);
 
         let q = self.rope.forward(q);
@@ -108,14 +114,20 @@ impl<B: Backend> CausalSelfAttention<B> {
         };
 
         let y = attention(
-            q, k, v, None, None,
+            q,
+            k,
+            v,
+            None,
+            None,
             AttentionModuleOptions {
                 is_causal: true,
                 ..Default::default()
             },
         );
 
-        let y = y.permute([0, 2, 1, 3]).reshape([batch_size, seq_len, self.n_embd]);
+        let y = y
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size, seq_len, self.n_embd]);
         let y = self.c_proj.forward(y);
         self.resid_dropout.forward(y)
     }
@@ -123,10 +135,10 @@ impl<B: Backend> CausalSelfAttention<B> {
     #[inline]
     pub fn forward_cached(
         &self,
-        x: Tensor<B, 3>,
-        cache: Option<LayerKV<B>>,
+        x: Tensor<3>,
+        cache: Option<LayerKV>,
         pos_offset: usize,
-    ) -> (Tensor<B, 3>, LayerKV<B>) {
+    ) -> (Tensor<3>, LayerKV) {
         let (q, mut k, mut v, batch_size, seq_len, _) = self.split_qkv(x);
 
         let q = self.rope.apply(q, pos_offset);
@@ -147,14 +159,20 @@ impl<B: Backend> CausalSelfAttention<B> {
         };
 
         let y = attention(
-            q, k_att, v_att, None, None,
+            q,
+            k_att,
+            v_att,
+            None,
+            None,
             AttentionModuleOptions {
                 is_causal: true,
                 ..Default::default()
             },
         );
 
-        let y = y.permute([0, 2, 1, 3]).reshape([batch_size, seq_len, self.n_embd]);
+        let y = y
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size, seq_len, self.n_embd]);
         let y = self.c_proj.forward(y);
         (self.resid_dropout.forward(y), new_cache)
     }
@@ -163,9 +181,11 @@ impl<B: Backend> CausalSelfAttention<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_flex::Flex;
+    use burn::tensor::Distribution;
 
-    type B = Flex;
+    fn test_device() -> Device {
+        Device::flex()
+    }
 
     fn test_config() -> GPTConfig {
         GPTConfig {
@@ -195,13 +215,17 @@ mod tests {
 
     #[test]
     fn forward_returns_correct_shape() {
-        let device = Default::default();
+        let device = test_device();
         let config = test_config();
-        let attn = CausalSelfAttention::<B>::new(&config, &device);
+        let attn = CausalSelfAttention::new(&config, &device);
 
         let batch = 2;
         let seq = 8;
-        let x = Tensor::<B, 3>::random([batch, seq, config.n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random(
+            [batch, seq, config.n_embd],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
         let y = attn.forward(x);
 
         assert_eq!(y.dims(), [batch, seq, config.n_embd]);
@@ -209,13 +233,17 @@ mod tests {
 
     #[test]
     fn forward_gqa_returns_correct_shape() {
-        let device = Default::default();
+        let device = test_device();
         let config = gqa_config();
-        let attn = CausalSelfAttention::<B>::new(&config, &device);
+        let attn = CausalSelfAttention::new(&config, &device);
 
         let batch = 2;
         let seq = 8;
-        let x = Tensor::<B, 3>::random([batch, seq, config.n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random(
+            [batch, seq, config.n_embd],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
         let y = attn.forward(x);
 
         assert_eq!(y.dims(), [batch, seq, config.n_embd]);
@@ -223,13 +251,17 @@ mod tests {
 
     #[test]
     fn forward_cached_equals_forward() {
-        let device = Default::default();
+        let device = test_device();
         let config = test_config();
-        let attn = CausalSelfAttention::<B>::new(&config, &device);
+        let attn = CausalSelfAttention::new(&config, &device);
 
         let batch = 1;
         let seq = 8;
-        let x = Tensor::<B, 3>::random([batch, seq, config.n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random(
+            [batch, seq, config.n_embd],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
 
         let expected = attn.forward(x.clone());
         let expected_last = expected.slice([0..1, seq - 1..seq, 0..config.n_embd]);
@@ -240,19 +272,26 @@ mod tests {
         let last = x.clone().slice([0..1, seq - 1..seq, 0..config.n_embd]);
         let (cached, _) = attn.forward_cached(last, Some(cache), seq - 1);
 
-        let diff = (expected_last - cached).abs().sum().into_scalar();
-        assert!(diff < 1e-4, "cached output differs from full forward: {diff}");
+        let diff = (expected_last - cached).abs().sum().into_scalar::<f32>();
+        assert!(
+            diff < 1e-4,
+            "cached output differs from full forward: {diff}"
+        );
     }
 
     #[test]
     fn forward_cached_gqa_equals_forward() {
-        let device = Default::default();
+        let device = test_device();
         let config = gqa_config();
-        let attn = CausalSelfAttention::<B>::new(&config, &device);
+        let attn = CausalSelfAttention::new(&config, &device);
 
         let batch = 1;
         let seq = 8;
-        let x = Tensor::<B, 3>::random([batch, seq, config.n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random(
+            [batch, seq, config.n_embd],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
 
         let expected = attn.forward(x.clone());
         let expected_last = expected.slice([0..1, seq - 1..seq, 0..config.n_embd]);
@@ -263,46 +302,88 @@ mod tests {
         let last = x.clone().slice([0..1, seq - 1..seq, 0..config.n_embd]);
         let (cached, _) = attn.forward_cached(last, Some(cache), seq - 1);
 
-        let diff = (expected_last - cached).abs().sum().into_scalar();
-        assert!(diff < 1e-4, "GQA cached output differs from full forward: {diff}");
+        let diff = (expected_last - cached).abs().sum().into_scalar::<f32>();
+        assert!(
+            diff < 1e-4,
+            "GQA cached output differs from full forward: {diff}"
+        );
     }
 
     #[test]
     fn cache_grows_on_successive_calls() {
-        let device = Default::default();
+        let device = test_device();
         let config = test_config();
-        let attn = CausalSelfAttention::<B>::new(&config, &device);
+        let attn = CausalSelfAttention::new(&config, &device);
 
         let batch = 1;
         let n_embd = config.n_embd;
         let head_dim = n_embd / config.n_head;
 
-        let t0 = Tensor::<B, 3>::random([batch, 1, n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
+        let t0 = Tensor::<3>::random(
+            [batch, 1, n_embd],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
         let (_, cache) = attn.forward_cached(t0, None, 0);
-        assert_eq!(cache.0.dims(), [1, config.n_head, 1, head_dim], "cache K should have seq_len=1 after first call");
+        assert_eq!(
+            cache.0.dims(),
+            [1, config.n_head, 1, head_dim],
+            "cache K should have seq_len=1 after first call"
+        );
 
-        let t1 = Tensor::<B, 3>::random([batch, 1, n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
+        let t1 = Tensor::<3>::random(
+            [batch, 1, n_embd],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
         let (_, cache) = attn.forward_cached(t1, Some(cache), 1);
-        assert_eq!(cache.0.dims(), [1, config.n_head, 2, head_dim], "cache K should have seq_len=2 after second call");
+        assert_eq!(
+            cache.0.dims(),
+            [1, config.n_head, 2, head_dim],
+            "cache K should have seq_len=2 after second call"
+        );
     }
 
     #[test]
     fn cache_grows_gqa_repeats_kv_heads() {
-        let device = Default::default();
+        let device = test_device();
         let config = gqa_config();
-        let attn = CausalSelfAttention::<B>::new(&config, &device);
+        let attn = CausalSelfAttention::new(&config, &device);
 
         let batch = 1;
         let n_embd = config.n_embd;
         let head_dim = n_embd / config.n_head;
 
-        let t0 = Tensor::<B, 3>::random([batch, 1, n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
+        let t0 = Tensor::<3>::random(
+            [batch, 1, n_embd],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
         let (_, cache) = attn.forward_cached(t0, None, 0);
         let (cached_k, _) = cache;
-        assert_eq!(cached_k.dims(), [1, 2, 1, head_dim], "GQA cache should store n_kv_head=2 heads");
+        assert_eq!(
+            cached_k.dims(),
+            [1, 2, 1, head_dim],
+            "GQA cache should store n_kv_head=2 heads"
+        );
 
-        let t1 = Tensor::<B, 3>::random([batch, 1, n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
-        let (_, cache) = attn.forward_cached(t1, Some((cached_k, Tensor::<B, 4>::zeros([1, 2, 1, head_dim], &device))), 1);
-        assert_eq!(cache.0.dims(), [1, 2, 2, head_dim], "GQA cache should have seq_len=2 after two calls");
+        let t1 = Tensor::<3>::random(
+            [batch, 1, n_embd],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let (_, cache) = attn.forward_cached(
+            t1,
+            Some((
+                cached_k,
+                Tensor::<4>::zeros([1, 2, 1, head_dim], &device),
+            )),
+            1,
+        );
+        assert_eq!(
+            cache.0.dims(),
+            [1, 2, 2, head_dim],
+            "GQA cache should have seq_len=2 after two calls"
+        );
     }
 }

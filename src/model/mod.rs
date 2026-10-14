@@ -7,20 +7,20 @@ use burn::{
     nn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, Linear, LinearConfig,
     },
-    tensor::{activation, backend::Backend, Int, Tensor},
+    prelude::*,
+    tensor::activation,
 };
-use burn::prelude::ToElement;
 
 /// RMSNorm — no learnable bias or mean subtraction.
 /// Formula: `x * weight / sqrt(mean(x^2) + eps)`.
 #[derive(Module, Debug)]
-pub struct RMSNorm<B: Backend> {
-    weight: Tensor<B, 1>,
+pub struct RMSNorm {
+    weight: Tensor<1>,
     eps: f64,
 }
 
-impl<B: Backend> RMSNorm<B> {
-    pub fn new(d_model: usize, device: &B::Device) -> Self {
+impl RMSNorm {
+    pub fn new(d_model: usize, device: &Device) -> Self {
         Self {
             weight: Tensor::ones([d_model], device),
             eps: 1e-5,
@@ -28,7 +28,7 @@ impl<B: Backend> RMSNorm<B> {
     }
 
     #[inline]
-    pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
+    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
         let mean_square = x.clone().powf_scalar(2).mean_dim(D - 1);
         let rms = (mean_square + self.eps).sqrt();
         x / rms * self.weight.clone().unsqueeze::<D>()
@@ -56,14 +56,14 @@ pub struct GPTConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct MLP<B: Backend> {
-    c_fc: Linear<B>,
-    c_proj: Linear<B>,
+pub struct MLP {
+    c_fc: Linear,
+    c_proj: Linear,
     dropout: Dropout,
 }
 
-impl<B: Backend> MLP<B> {
-    pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
+impl MLP {
+    pub fn new(config: &GPTConfig, device: &Device) -> Self {
         let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
         Self {
             c_fc: LinearConfig::new(config.n_embd, 4 * config.n_embd)
@@ -85,7 +85,7 @@ impl<B: Backend> MLP<B> {
     }
 
     #[inline]
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.c_fc.forward(x);
         let x = activation::relu(x).square();
         let x = self.c_proj.forward(x);
@@ -94,15 +94,15 @@ impl<B: Backend> MLP<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct Block<B: Backend> {
-    ln_1: RMSNorm<B>,
-    attn: CausalSelfAttention<B>,
-    ln_2: RMSNorm<B>,
-    mlp: MLP<B>,
+pub struct Block {
+    ln_1: RMSNorm,
+    attn: CausalSelfAttention,
+    ln_2: RMSNorm,
+    mlp: MLP,
 }
 
-impl<B: Backend> Block<B> {
-    pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
+impl Block {
+    pub fn new(config: &GPTConfig, device: &Device) -> Self {
         Self {
             ln_1: RMSNorm::new(config.n_embd, device),
             attn: CausalSelfAttention::new(config, device),
@@ -112,7 +112,7 @@ impl<B: Backend> Block<B> {
     }
 
     #[inline]
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()));
         x.clone() + self.mlp.forward(self.ln_2.forward(x))
     }
@@ -120,10 +120,10 @@ impl<B: Backend> Block<B> {
     #[inline]
     pub fn forward_cached(
         &self,
-        x: Tensor<B, 3>,
-        cache: Option<LayerKV<B>>,
+        x: Tensor<3>,
+        cache: Option<LayerKV>,
         pos_offset: usize,
-    ) -> (Tensor<B, 3>, LayerKV<B>) {
+    ) -> (Tensor<3>, LayerKV) {
         let (attn_out, new_cache) =
             self.attn
                 .forward_cached(self.ln_1.forward(x.clone()), cache, pos_offset);
@@ -134,14 +134,14 @@ impl<B: Backend> Block<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct GPT<B: Backend> {
-    token_embedding: Embedding<B>,
-    blocks: Vec<Block<B>>,
-    ln_f: RMSNorm<B>,
+pub struct GPT {
+    token_embedding: Embedding,
+    blocks: Vec<Block>,
+    ln_f: RMSNorm,
 }
 
-impl<B: Backend> GPT<B> {
-    pub fn new(config: &GPTConfig, device: &B::Device) -> Self {
+impl GPT {
+    pub fn new(config: &GPTConfig, device: &Device) -> Self {
         let token_embedding = EmbeddingConfig::new(config.vocab_size, config.n_embd).init(device);
 
         let blocks = (0..config.n_layer)
@@ -158,7 +158,7 @@ impl<B: Backend> GPT<B> {
     }
 
     #[inline]
-    pub fn forward(&self, idx: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+    pub fn forward(&self, idx: Tensor<2, Int>) -> Tensor<3> {
         let [batch, seq_len] = idx.dims();
 
         let mut x = self.token_embedding.forward(idx);
@@ -180,9 +180,9 @@ impl<B: Backend> GPT<B> {
     #[inline]
     pub fn forward_cached(
         &self,
-        idx: Tensor<B, 2, Int>,
-        cache: Option<KVCache<B>>,
-    ) -> (Tensor<B, 3>, KVCache<B>) {
+        idx: Tensor<2, Int>,
+        cache: Option<KVCache>,
+    ) -> (Tensor<3>, KVCache) {
         let [batch, seq_len] = idx.dims();
 
         let pos_offset = cache.as_ref().map_or(0, |c| c.layers[0].0.dims()[2]);
@@ -192,8 +192,7 @@ impl<B: Backend> GPT<B> {
         let mut new_layers = Vec::with_capacity(self.blocks.len());
         for (i, block) in self.blocks.iter().enumerate() {
             let layer_cache = cache.as_ref().map(|c| c.layers[i].clone());
-            let (out, layer_kv) =
-                block.forward_cached(x, layer_cache, pos_offset);
+            let (out, layer_kv) = block.forward_cached(x, layer_cache, pos_offset);
             x = out;
             new_layers.push(layer_kv);
         }
@@ -207,24 +206,29 @@ impl<B: Backend> GPT<B> {
             .matmul(weight.transpose())
             .reshape([batch, seq_len, vocab_size]);
 
-        (logits, KVCache { layers: new_layers })
+        (
+            logits,
+            KVCache {
+                layers: new_layers,
+            },
+        )
     }
 
     /// Auto-regressive generation with KV cache.
     pub fn generate(
         &self,
-        idx: Tensor<B, 2, Int>,
+        idx: Tensor<2, Int>,
         max_new_tokens: usize,
         sampling: &SamplingParams,
         block_size: usize,
         mut on_token: impl FnMut(i32),
-    ) -> Tensor<B, 2, Int> {
+    ) -> Tensor<2, Int> {
         let [batch, prompt_len] = idx.dims();
 
         let (logits, mut cache) = self.forward_cached(idx.clone(), None);
         let mut next_logits = logits;
         let mut prev_tokens = idx.clone();
-        let mut generated: Vec<Tensor<B, 2, Int>> = Vec::new();
+        let mut generated: Vec<Tensor<2, Int>> = Vec::new();
 
         for _ in 0..max_new_tokens {
             let [_, len, vocab] = next_logits.dims();
@@ -232,9 +236,9 @@ impl<B: Backend> GPT<B> {
                 .slice([0..batch, len - 1..len, 0..vocab])
                 .reshape([batch, vocab]);
 
-            let idx_next = sample_token::<B>(&logits, sampling, &prev_tokens);
+            let idx_next = sample_token(&logits, sampling, &prev_tokens);
 
-            let token_id = idx_next.clone().into_scalar().to_i32();
+            let token_id: i32 = idx_next.clone().into_scalar();
             on_token(token_id);
 
             let total_len = prompt_len + generated.len() + 1;
@@ -263,9 +267,10 @@ impl<B: Backend> GPT<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_flex::Flex;
 
-    type B = Flex;
+    fn test_device() -> Device {
+        Device::flex()
+    }
 
     fn create_test_config() -> GPTConfig {
         GPTConfig {
@@ -282,13 +287,13 @@ mod tests {
 
     #[test]
     fn test_gpt_forward_shape() {
-        let device = Default::default();
+        let device = test_device();
         let config = create_test_config();
-        let gpt = GPT::<B>::new(&config, &device);
+        let gpt = GPT::new(&config, &device);
 
         let batch_size = 2;
         let seq_len = 10;
-        let input = Tensor::<B, 2, Int>::zeros([batch_size, seq_len], &device);
+        let input = Tensor::<2, Int>::zeros([batch_size, seq_len], &device);
 
         let output = gpt.forward(input);
         let [b, s, v] = output.dims();
@@ -300,14 +305,14 @@ mod tests {
 
     #[test]
     fn test_kv_cache_equivalence() {
-        let device = Default::default();
+        let device = test_device();
         let config = create_test_config();
-        let gpt = GPT::<B>::new(&config, &device);
+        let gpt = GPT::new(&config, &device);
 
         let batch_size = 1;
         let prompt_len = 5;
-        let prompt = Tensor::<B, 1, Int>::arange(0..prompt_len as i64, &device)
-            .reshape([batch_size, prompt_len]);
+        let prompt =
+            Tensor::<1, Int>::arange(0..prompt_len as i64, &device).reshape([batch_size, prompt_len]);
 
         let full_logits = gpt.forward(prompt.clone());
         let expected_logits = full_logits.slice([0..1, prompt_len - 1..prompt_len]);
@@ -319,7 +324,7 @@ mod tests {
         let (cached_logits, _) = gpt.forward_cached(last_token, Some(cache));
 
         let diff = (expected_logits - cached_logits).abs().sum();
-        let diff_val = diff.into_scalar();
+        let diff_val: f32 = diff.into_scalar();
 
         assert!(
             diff_val < 1e-4,
@@ -330,14 +335,19 @@ mod tests {
 
     #[test]
     fn generate_produces_correct_number_of_tokens() {
-        let device = Default::default();
+        let device = test_device();
         let config = create_test_config();
-        let gpt = GPT::<B>::new(&config, &device);
+        let gpt = GPT::new(&config, &device);
 
         let prompt_len = 3;
         let max_new = 5;
-        let prompt = Tensor::<B, 2, Int>::zeros([1, prompt_len], &device);
-        let sampling = SamplingParams { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0 };
+        let prompt = Tensor::<2, Int>::zeros([1, prompt_len], &device);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
 
         let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {});
         let [_, total_len] = output.dims();
@@ -346,23 +356,32 @@ mod tests {
 
     #[test]
     fn generate_respects_block_size_limit() {
-        let device = Default::default();
+        let device = test_device();
         let config = create_test_config();
-        let gpt = GPT::<B>::new(&config, &device);
+        let gpt = GPT::new(&config, &device);
 
         let prompt_len = 14;
         let max_new = 10;
-        let prompt = Tensor::<B, 2, Int>::zeros([1, prompt_len], &device);
-        let sampling = SamplingParams { temperature: 0.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0 };
+        let prompt = Tensor::<2, Int>::zeros([1, prompt_len], &device);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
 
         let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {});
         let [_, total_len] = output.dims();
-        assert!(total_len <= config.block_size, "output len {total_len} exceeds block_size {}", config.block_size);
+        assert!(
+            total_len <= config.block_size,
+            "output len {total_len} exceeds block_size {}",
+            config.block_size
+        );
     }
 
     #[test]
     fn test_gqa_attention_shapes() {
-        let device = Default::default();
+        let device = test_device();
         let config = GPTConfig {
             vocab_size: 100,
             n_layer: 1,
@@ -373,11 +392,11 @@ mod tests {
             dropout: 0.0,
             rope_theta: 10000.0,
         };
-        let gpt = GPT::<B>::new(&config, &device);
+        let gpt = GPT::new(&config, &device);
 
         let batch_size = 2;
         let seq_len = 10;
-        let input = Tensor::<B, 2, Int>::zeros([batch_size, seq_len], &device);
+        let input = Tensor::<2, Int>::zeros([batch_size, seq_len], &device);
 
         let output = gpt.forward(input);
         let [b, s, v] = output.dims();
@@ -389,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_gqa_kv_cache_equivalence() {
-        let device = Default::default();
+        let device = test_device();
         let config = GPTConfig {
             vocab_size: 100,
             n_layer: 1,
@@ -400,12 +419,12 @@ mod tests {
             dropout: 0.0,
             rope_theta: 10000.0,
         };
-        let gpt = GPT::<B>::new(&config, &device);
+        let gpt = GPT::new(&config, &device);
 
         let batch_size = 1;
         let prompt_len = 5;
-        let prompt = Tensor::<B, 1, Int>::arange(0..prompt_len as i64, &device)
-            .reshape([batch_size, prompt_len]);
+        let prompt =
+            Tensor::<1, Int>::arange(0..prompt_len as i64, &device).reshape([batch_size, prompt_len]);
 
         let full_logits = gpt.forward(prompt.clone());
         let expected_logits = full_logits.slice([0..1, prompt_len - 1..prompt_len]);
@@ -421,7 +440,7 @@ mod tests {
         let (cached_logits, _) = gpt.forward_cached(last_token, Some(cache));
 
         let diff = (expected_logits - cached_logits).abs().sum();
-        let diff_val = diff.into_scalar();
+        let diff_val: f32 = diff.into_scalar();
 
         assert!(
             diff_val < 1e-4,

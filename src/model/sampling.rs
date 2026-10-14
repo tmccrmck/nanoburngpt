@@ -1,5 +1,6 @@
 use burn::{
-    tensor::{activation, backend::Backend, IndexingUpdateOp, Int, Tensor},
+    prelude::*,
+    tensor::{activation, ops::IndexingUpdateOp},
 };
 use rand::distr::{Distribution, weighted::WeightedIndex};
 
@@ -32,21 +33,21 @@ impl Default for SamplingParams {
 /// Sample next token from logits [batch, vocab], returns [batch, 1] int tensor.
 /// `prev_tokens` [batch, seq_len] contains all tokens generated so far (for repetition penalty).
 #[inline]
-pub(crate) fn sample_token<B: Backend>(
-    logits: &Tensor<B, 2>,
+pub(crate) fn sample_token(
+    logits: &Tensor<2>,
     params: &SamplingParams,
-    prev_tokens: &Tensor<B, 2, Int>,
-) -> Tensor<B, 2, Int> {
+    prev_tokens: &Tensor<2, Int>,
+) -> Tensor<2, Int> {
     let [batch, vocab] = logits.dims();
     let device = logits.device();
 
     let logits = if params.repetition_penalty > 1.0 + 1e-6 {
         let [_, seq_len] = prev_tokens.dims();
-        let ones = Tensor::<B, 2>::ones([batch, seq_len], &device);
-        let counts = Tensor::<B, 2>::zeros([batch, vocab], &device)
+        let ones = Tensor::<2>::ones([batch, seq_len], &device);
+        let counts = Tensor::<2>::zeros([batch, vocab], &device)
             .scatter(1, prev_tokens.clone(), ones, IndexingUpdateOp::Add);
         let penalty = 1.0 / params.repetition_penalty;
-        let mask = Tensor::<B, 2>::ones([batch, vocab], &device)
+        let mask = Tensor::<2>::ones([batch, vocab], &device)
             - (1.0 - penalty) * counts.clamp(0.0, 1.0);
         logits.clone() * mask
     } else {
@@ -74,7 +75,7 @@ pub(crate) fn sample_token<B: Backend>(
 
         // Top-p or combined filtering: keep CPU path
         let probs = activation::softmax(logits, 1);
-        let probs_data = probs.into_data().convert::<f32>();
+        let probs_data = probs.into_data();
         let probs_f32 = probs_data.as_slice::<f32>().expect("f32 probs");
 
         let mut rng = rand::rng();
@@ -87,7 +88,7 @@ pub(crate) fn sample_token<B: Backend>(
             })
             .collect();
 
-        Tensor::<B, 1, Int>::from_ints(tokens.as_slice(), &device).unsqueeze::<2>()
+        Tensor::<1, Int>::from_ints(tokens.as_slice(), &device).unsqueeze::<2>()
     }
 }
 

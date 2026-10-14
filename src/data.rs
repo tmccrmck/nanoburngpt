@@ -1,6 +1,6 @@
 use burn::{
-    data::{dataloader::batcher::Batcher, dataset::Dataset},
-    tensor::{Int, Tensor, backend::Backend},
+    data::{dataloader::batcher::Batcher, dataset::{Dataset, DatasetError}},
+    prelude::*,
 };
 use std::path::Path;
 use tiktoken_rs::r50k_base;
@@ -43,16 +43,16 @@ impl TextDataset {
 }
 
 impl Dataset<TextDatasetItem> for TextDataset {
-    fn get(&self, index: usize) -> Option<TextDatasetItem> {
+    fn get(&self, index: usize) -> Result<TextDatasetItem, DatasetError> {
         if index >= self.len() {
-            return None;
+            panic!("TextDataset index out of bounds: {index} >= {}", self.len());
         }
 
         let chunk = &self.data[index..index + self.block_size + 1];
         let input = chunk[..self.block_size].to_vec();
         let target = chunk[1..].to_vec();
 
-        Some(TextDatasetItem { input, target })
+        Ok(TextDatasetItem { input, target })
     }
 
     fn len(&self) -> usize {
@@ -66,28 +66,25 @@ pub struct TextDatasetItem {
     pub target: Vec<usize>,
 }
 
-pub struct TextGenerationBatcher<B: Backend> {
+#[derive(Clone, Debug)]
+pub struct TextGenerationBatcher {
     block_size: usize,
-    _b: std::marker::PhantomData<B>,
 }
 
-impl<B: Backend> TextGenerationBatcher<B> {
+impl TextGenerationBatcher {
     pub fn new(block_size: usize) -> Self {
-        Self {
-            block_size,
-            _b: std::marker::PhantomData,
-        }
+        Self { block_size }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct TextGenerationBatch<B: Backend> {
-    pub inputs: Tensor<B, 2, Int>,
-    pub targets: Tensor<B, 2, Int>,
+pub struct TextGenerationBatch {
+    pub inputs: Tensor<2, Int>,
+    pub targets: Tensor<2, Int>,
 }
 
-impl<B: Backend> Batcher<B, TextDatasetItem, TextGenerationBatch<B>> for TextGenerationBatcher<B> {
-    fn batch(&self, items: Vec<TextDatasetItem>, device: &B::Device) -> TextGenerationBatch<B> {
+impl Batcher<TextDatasetItem, TextGenerationBatch> for TextGenerationBatcher {
+    fn batch(&self, items: Vec<TextDatasetItem>, device: &Device) -> TextGenerationBatch {
         let batch_size = items.len();
         let mut inputs_flat = Vec::with_capacity(batch_size * self.block_size);
         let mut targets_flat = Vec::with_capacity(batch_size * self.block_size);
@@ -96,9 +93,9 @@ impl<B: Backend> Batcher<B, TextDatasetItem, TextGenerationBatch<B>> for TextGen
             targets_flat.extend_from_slice(&item.target);
         }
 
-        let inputs = Tensor::<B, 1, Int>::from_ints(inputs_flat.as_slice(), device)
+        let inputs = Tensor::<1, Int>::from_ints(inputs_flat.as_slice(), device)
             .reshape([batch_size, self.block_size]);
-        let targets = Tensor::<B, 1, Int>::from_ints(targets_flat.as_slice(), device)
+        let targets = Tensor::<1, Int>::from_ints(targets_flat.as_slice(), device)
             .reshape([batch_size, self.block_size]);
 
         TextGenerationBatch { inputs, targets }
@@ -242,10 +239,10 @@ mod tests {
     }
 
     #[test]
-    fn get_out_of_bounds_returns_none() {
+    #[should_panic]
+    fn get_out_of_bounds_panics() {
         let ds = make_dataset(10, 3);
-        assert!(ds.get(ds.len()).is_none());
-        assert!(ds.get(100).is_none());
+        let _ = ds.get(ds.len());
     }
 
     #[test]
@@ -256,13 +253,11 @@ mod tests {
 
     #[test]
     fn batcher_output_shapes() {
-        use burn_flex::Flex;
-        type B = Flex;
         let block_size = 4;
         let ds = make_dataset(20, block_size);
-        let batcher = TextGenerationBatcher::<B>::new(block_size);
-        let items: Vec<_> = (0..3).filter_map(|i| ds.get(i)).collect();
-        let batch = batcher.batch(items, &Default::default());
+        let batcher = TextGenerationBatcher::new(block_size);
+        let items: Vec<_> = (0..3).map(|i| ds.get(i).unwrap()).collect();
+        let batch = batcher.batch(items, &Device::flex());
         assert_eq!(batch.inputs.dims(), [3, block_size]);
         assert_eq!(batch.targets.dims(), [3, block_size]);
     }

@@ -1,12 +1,8 @@
 #![recursion_limit = "512"]
 
-#[cfg(not(any(feature = "wgpu", feature = "cuda")))]
-compile_error!("Enable at least one backend feature: `wgpu` or `cuda`");
-
 use std::str::FromStr;
 
-use burn::backend::Autodiff;
-use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::prelude::*;
 use clap::{Parser, Subcommand};
 use nanoburngpt::{
     datasets::Dataset,
@@ -22,7 +18,7 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Force use of CPU (burn-flex backend)
+    /// Force use of CPU (flex backend)
     #[arg(long, global = true)]
     cpu: bool,
 }
@@ -75,7 +71,8 @@ enum Commands {
         /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
         #[arg(long, default_value_t = 10000.0)]
         rope_theta: f64,
-        /// Enable mixed precision (AMP)
+        /// Enable mixed precision (AMP) — currently a no-op on Burn 0.22
+        /// (dtype defaults API not yet wired); training runs in f32.
         #[arg(long)]
         amp: bool,
         /// Gradient accumulation steps (simulates larger batch size with less memory)
@@ -102,13 +99,29 @@ enum Commands {
     },
 }
 
-fn dispatch<AB, B>(cli: Cli, device: B::Device)
-where
-    AB: AutodiffBackend<InnerBackend = B>,
-    AB: Backend<Device = B::Device>,
-    B: Backend,
-    B::Device: std::fmt::Debug + Clone,
-{
+fn select_device(cpu: bool) -> Device {
+    if cpu {
+        return Device::flex();
+    }
+    #[cfg(feature = "cuda")]
+    {
+        return Device::cuda(0);
+    }
+    #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
+    {
+        Device::wgpu(DeviceKind::DefaultDevice)
+    }
+    #[cfg(not(any(feature = "wgpu", feature = "cuda")))]
+    {
+        return Device::flex();
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let cpu = cli.cpu;
+    let device = select_device(cpu);
+
     match cli.command {
         Commands::Train {
             model,
@@ -169,8 +182,13 @@ where
             );
             println!("Dataset: {}", dataset);
             println!("Device: {:?}", device);
+            if amp {
+                println!(
+                    "Warning: --amp is a no-op on Burn 0.22 (training in f32)."
+                );
+            }
 
-            run_training::<AB>(device, dataset_enum, gpt_config, training_config);
+            run_training(device, dataset_enum, gpt_config, training_config);
         }
         Commands::Generate {
             artifact_dir,
@@ -187,48 +205,7 @@ where
                 repetition_penalty: 1.0,
             };
             println!("Generating text on device: {:?}", device);
-            generate_text::<B>(device, &artifact_dir, &prompt, max_tokens, &sampling);
+            generate_text(device, &artifact_dir, &prompt, max_tokens, &sampling);
         }
-    }
-}
-
-fn main() {
-    let cli = Cli::parse();
-
-    let amp = match &cli.command {
-        Commands::Train { amp, .. } => *amp,
-        _ => false,
-    };
-
-    #[cfg(feature = "cuda")]
-    {
-        use burn::backend::cuda::{Cuda, CudaDevice};
-        if cli.cpu {
-            use burn_flex::Flex;
-            dispatch::<Autodiff<Flex>, Flex>(cli, Default::default());
-        } else if amp {
-            dispatch::<Autodiff<Cuda<burn::tensor::f16, i32>>, Cuda<burn::tensor::f16, i32>>(cli, CudaDevice::default());
-        } else {
-            dispatch::<Autodiff<Cuda<f32, i32>>, Cuda<f32, i32>>(cli, CudaDevice::default());
-        }
-    }
-
-    #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
-    {
-        use burn::backend::wgpu::{Wgpu, WgpuDevice};
-        if cli.cpu {
-            use burn_flex::Flex;
-            dispatch::<Autodiff<Flex>, Flex>(cli, Default::default());
-        } else if amp {
-            dispatch::<Autodiff<Wgpu<burn::tensor::f16, i32>>, Wgpu<burn::tensor::f16, i32>>(cli, WgpuDevice::default());
-        } else {
-            dispatch::<Autodiff<Wgpu<f32, i32>>, Wgpu<f32, i32>>(cli, WgpuDevice::default());
-        }
-    }
-
-    #[cfg(not(any(feature = "wgpu", feature = "cuda")))]
-    {
-        use burn_flex::Flex;
-        dispatch::<Autodiff<Flex>, Flex>(cli, Default::default());
     }
 }

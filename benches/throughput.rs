@@ -1,6 +1,6 @@
 /// Benchmarks for the hot paths in nanoburngpt.
 ///
-/// Uses the NdArray CPU backend so no GPU is required.  These benchmarks are
+/// Uses the Flex CPU backend so no GPU is required.  These benchmarks are
 /// fast enough to run in CI and give stable numbers useful for spotting
 /// regressions when changing model internals.
 ///
@@ -9,13 +9,9 @@
 ///   cargo bench -- forward          # filter by name
 ///   cargo bench -- --save-baseline main
 ///   cargo bench -- --baseline main  # compare against saved baseline
-use burn_flex::Flex;
+use burn::prelude::*;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use nanoburngpt::model::{GPT, GPTConfig, SamplingParams};
-use burn::tensor::{Int, Tensor};
-
-// Use Flex as the default CPU backend for benchmarking.
-type B = Flex;
 
 fn make_config(n_layer: usize, n_head: usize, n_embd: usize, block_size: usize) -> GPTConfig {
     GPTConfig {
@@ -30,16 +26,20 @@ fn make_config(n_layer: usize, n_head: usize, n_embd: usize, block_size: usize) 
     }
 }
 
+fn test_device() -> Device {
+    Device::flex()
+}
+
 /// Benchmark the full GPT forward pass across different sequence lengths.
 /// Uses a tiny model so the per-step work is roughly fixed and seq_len is the variable.
 fn bench_forward(c: &mut Criterion) {
-    let device = Default::default();
+    let device = test_device();
     let config = make_config(2, 4, 64, 256);
-    let gpt = GPT::<B>::new(&config, &device);
+    let gpt = GPT::new(&config, &device);
 
     let mut group = c.benchmark_group("forward");
     for &seq_len in &[32usize, 64, 128, 256] {
-        let input = Tensor::<B, 2, Int>::zeros([1, seq_len], &device);
+        let input = Tensor::<2, Int>::zeros([1, seq_len], &device);
         group.bench_with_input(BenchmarkId::from_parameter(seq_len), &seq_len, |b, _| {
             b.iter(|| gpt.forward(input.clone()))
         });
@@ -50,17 +50,17 @@ fn bench_forward(c: &mut Criterion) {
 /// Benchmark a single KV-cache decode step (prefill then one token decode).
 /// This represents the steady-state cost per generated token during inference.
 fn bench_decode_step(c: &mut Criterion) {
-    let device = Default::default();
+    let device = test_device();
     let config = make_config(2, 4, 64, 256);
-    let gpt = GPT::<B>::new(&config, &device);
+    let gpt = GPT::new(&config, &device);
 
     let mut group = c.benchmark_group("decode_step");
     for &prompt_len in &[8usize, 32, 64, 128] {
-        let prompt = Tensor::<B, 2, Int>::zeros([1, prompt_len], &device);
+        let prompt = Tensor::<2, Int>::zeros([1, prompt_len], &device);
         // Pre-warm: build the KV cache up to prompt_len so the benchmark only
         // measures the marginal cost of decoding one more token.
         let (_, cache) = gpt.forward_cached(prompt, None);
-        let next_token = Tensor::<B, 2, Int>::zeros([1, 1], &device);
+        let next_token = Tensor::<2, Int>::zeros([1, 1], &device);
 
         group.bench_with_input(
             BenchmarkId::new("prompt_len", prompt_len),
@@ -107,18 +107,19 @@ fn bench_filter_sampling(c: &mut Criterion) {
 
 /// Benchmark generate() end-to-end (prefill + N decode steps, greedy sampling).
 fn bench_generate(c: &mut Criterion) {
-    let device = Default::default();
+    let device = test_device();
     let config = make_config(2, 4, 64, 256);
-    let gpt = GPT::<B>::new(&config, &device);
+    let gpt = GPT::new(&config, &device);
     let sampling = SamplingParams {
         temperature: 0.0, // greedy — deterministic, no randomness overhead
         top_k: 0,
         top_p: 1.0,
+        repetition_penalty: 1.0,
     };
 
     let mut group = c.benchmark_group("generate");
     for &max_new in &[8usize, 32, 64] {
-        let prompt = Tensor::<B, 2, Int>::zeros([1, 8], &device);
+        let prompt = Tensor::<2, Int>::zeros([1, 8], &device);
         group.bench_with_input(
             BenchmarkId::new("max_new_tokens", max_new),
             &max_new,

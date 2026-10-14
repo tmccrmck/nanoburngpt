@@ -9,10 +9,11 @@ use burn::{
     grad_clipping::GradientClippingConfig,
     module::Module,
     nn::loss::CrossEntropyLossConfig,
-    optim::AdamWConfig,
-    optim::lr_scheduler::LrScheduler,
-    record::CompactRecorder,
-    tensor::backend::{AutodiffBackend, Backend},
+    optim::{
+        AdamWConfig,
+        lr_scheduler::{LrScheduler, LrSchedulerRecord},
+    },
+    prelude::*,
     train::{
         ClassificationOutput, InferenceStep, Learner, SupervisedTraining, TrainOutput, TrainStep,
         checkpoint::MetricCheckpointingStrategy,
@@ -72,18 +73,11 @@ impl WarmupCosineScheduler {
             total_iters,
             max_lr,
             min_lr,
-            current_iter: 0,
+            current_iter: usize::MAX,
         }
     }
-}
 
-impl LrScheduler for WarmupCosineScheduler {
-    type Record<B: burn::tensor::backend::Backend> = usize;
-
-    fn step(&mut self) -> f64 {
-        let iter = self.current_iter;
-        self.current_iter += 1;
-
+    fn lr_at(&self, iter: usize) -> f64 {
         if self.warmup_iters > 0 && iter < self.warmup_iters {
             // Linear ramp: 0 → max_lr over warmup_iters steps
             self.max_lr * (iter + 1) as f64 / self.warmup_iters as f64
@@ -98,14 +92,24 @@ impl LrScheduler for WarmupCosineScheduler {
             self.min_lr + coeff * (self.max_lr - self.min_lr)
         }
     }
+}
 
-    fn to_record<B: burn::tensor::backend::Backend>(&self) -> Self::Record<B> {
-        self.current_iter
+impl LrScheduler for WarmupCosineScheduler {
+    fn step(&mut self) -> f64 {
+        // wrapping_add so first step() computes lr_at(0), matching
+        // Burn's CosineAnnealing convention (current_iter starts at MAX).
+        self.current_iter = self.current_iter.wrapping_add(1);
+        self.lr_at(self.current_iter)
     }
 
-    fn load_record<B: burn::tensor::backend::Backend>(mut self, record: Self::Record<B>) -> Self {
-        self.current_iter = record;
-        self
+    fn to_record(&self) -> LrSchedulerRecord {
+        LrSchedulerRecord::new().with_scalar("current_iter", self.current_iter as u64)
+    }
+
+    fn load_record(&mut self, record: LrSchedulerRecord) {
+        if let Some(current_iter) = record.scalar::<u64>("current_iter") {
+            self.current_iter = current_iter as usize;
+        }
     }
 }
 
@@ -113,8 +117,8 @@ impl LrScheduler for WarmupCosineScheduler {
 // Model training/inference steps
 // ---------------------------------------------------------------------------
 
-impl<B: Backend> GPT<B> {
-    pub fn forward_classification(&self, item: TextGenerationBatch<B>) -> ClassificationOutput<B> {
+impl GPT {
+    pub fn forward_classification(&self, item: TextGenerationBatch) -> ClassificationOutput {
         let targets = item.targets; // [batch, seq]
         let [batch_size, seq_len] = targets.dims();
 
@@ -136,21 +140,21 @@ impl<B: Backend> GPT<B> {
     }
 }
 
-impl<B: AutodiffBackend> TrainStep for GPT<B> {
-    type Input = TextGenerationBatch<B>;
-    type Output = ClassificationOutput<B>;
+impl TrainStep for GPT {
+    type Input = TextGenerationBatch;
+    type Output = ClassificationOutput;
 
-    fn step(&self, item: TextGenerationBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
+    fn step(&self, item: TextGenerationBatch) -> TrainOutput<ClassificationOutput> {
         let item = self.forward_classification(item);
         TrainOutput::new(self, item.loss.backward(), item)
     }
 }
 
-impl<B: Backend> InferenceStep for GPT<B> {
-    type Input = TextGenerationBatch<B>;
-    type Output = ClassificationOutput<B>;
+impl InferenceStep for GPT {
+    type Input = TextGenerationBatch;
+    type Output = ClassificationOutput;
 
-    fn step(&self, item: TextGenerationBatch<B>) -> ClassificationOutput<B> {
+    fn step(&self, item: TextGenerationBatch) -> ClassificationOutput {
         self.forward_classification(item)
     }
 }
@@ -159,8 +163,8 @@ impl<B: Backend> InferenceStep for GPT<B> {
 // Training entry point
 // ---------------------------------------------------------------------------
 
-pub fn run_training<B: AutodiffBackend>(
-    device: B::Device,
+pub fn run_training(
+    device: Device,
     dataset: Dataset,
     mut gpt_config: GPTConfig,
     training_config: TrainingConfig,
@@ -195,8 +199,8 @@ pub fn run_training<B: AutodiffBackend>(
         training_config.warmup_iters
     );
 
-    let batcher_train = TextGenerationBatcher::<B>::new(gpt_config.block_size);
-    let batcher_val = TextGenerationBatcher::<B::InnerBackend>::new(gpt_config.block_size);
+    let batcher_train = TextGenerationBatcher::new(gpt_config.block_size);
+    let batcher_val = TextGenerationBatcher::new(gpt_config.block_size);
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
         .batch_size(training_config.batch_size)
@@ -227,11 +231,12 @@ pub fn run_training<B: AutodiffBackend>(
         total_iters.max(1),
     );
 
+    let device = device.autodiff();
     let model = GPT::new(&gpt_config, &device);
     let learner = Learner::new(model, optim, lr_scheduler);
 
     let strategy = MetricCheckpointingStrategy::new(
-        &PerplexityMetric::<B>::new(),
+        &PerplexityMetric::new(),
         Aggregate::Mean,
         Direction::Lowest,
         Split::Valid,
@@ -244,16 +249,20 @@ pub fn run_training<B: AutodiffBackend>(
         .metric_valid_numeric(AccuracyMetric::new())
         .metric_train_numeric(PerplexityMetric::new())
         .metric_valid_numeric(PerplexityMetric::new())
-        .with_file_checkpointer(CompactRecorder::new())
+        .with_default_checkpointers()
         .with_checkpointing_strategy(strategy)
         .num_epochs(training_config.num_epochs)
         .grads_accumulation(training_config.grad_accum_steps)
         .summary()
         .launch(learner);
 
+    if let Some(err) = &result.error {
+        eprintln!("Training failed: {err:?}");
+    }
+
     result
         .model
-        .save_file("artifacts/model_final", &CompactRecorder::new())
+        .save_file("artifacts/model_final")
         .expect("Failed to save final model");
     println!("Model saved to artifacts/model_final");
 }
@@ -266,11 +275,9 @@ pub fn run_training<B: AutodiffBackend>(
 mod tests {
     use super::*;
     use crate::data::TextDataset;
-    use burn::backend::Autodiff;
-    use burn::data::dataloader::Dataset as BurnDataset;
+    use burn::data::dataset::Dataset as BurnDataset;
     use burn::data::dataloader::batcher::Batcher;
     use burn::optim::Optimizer;
-    use burn_flex::Flex;
 
     fn scheduler(max_lr: f64, min_lr: f64, warmup: usize, total: usize) -> WarmupCosineScheduler {
         WarmupCosineScheduler::new(max_lr, min_lr, warmup, total)
@@ -336,8 +343,16 @@ mod tests {
         let lrs = steps(&mut s, warmup + 1);
         // lrs[warmup-1] is the last warmup step (should be max_lr)
         // lrs[warmup]   is the first cosine step (progress=0 → max_lr)
-        assert!((lrs[warmup - 1] - max_lr).abs() < 1e-10, "last warmup step: {}", lrs[warmup - 1]);
-        assert!((lrs[warmup] - max_lr).abs() < 1e-10, "first cosine step: {}", lrs[warmup]);
+        assert!(
+            (lrs[warmup - 1] - max_lr).abs() < 1e-10,
+            "last warmup step: {}",
+            lrs[warmup - 1]
+        );
+        assert!(
+            (lrs[warmup] - max_lr).abs() < 1e-10,
+            "first cosine step: {}",
+            lrs[warmup]
+        );
     }
 
     #[test]
@@ -351,8 +366,7 @@ mod tests {
 
     #[test]
     fn test_training_convergence() {
-        type B = Autodiff<Flex>;
-        let device = Default::default();
+        let device = Device::flex().autodiff();
 
         // 1. Create a tiny dataset: "ABCABCABC..."
         let block_size = 4;
@@ -369,17 +383,17 @@ mod tests {
             dropout: 0.0,
             rope_theta: 10000.0,
         };
-        let mut model = GPT::<B>::new(&config, &device);
+        let mut model = GPT::new(&config, &device);
 
         let mut optim = AdamWConfig::new().init();
         let mut lr_scheduler = WarmupCosineScheduler::new(0.01, 0.01, 0, 100);
-        let batcher = TextGenerationBatcher::<B>::new(block_size);
+        let batcher = TextGenerationBatcher::new(block_size);
 
         // 2. Initial loss
         let item = BurnDataset::get(&dataset, 0).unwrap();
         let batch = batcher.batch(vec![item.clone()], &device);
         let output = model.forward_classification(batch);
-        let initial_loss = output.loss.into_scalar();
+        let initial_loss: f32 = output.loss.into_scalar();
 
         // 3. Train for 10 steps
         for _ in 0..10 {
@@ -391,7 +405,7 @@ mod tests {
         // 4. Final loss
         let batch = batcher.batch(vec![item.clone()], &device);
         let output = model.forward_classification(batch);
-        let final_loss = output.loss.into_scalar();
+        let final_loss: f32 = output.loss.into_scalar();
 
         assert!(
             final_loss < initial_loss,

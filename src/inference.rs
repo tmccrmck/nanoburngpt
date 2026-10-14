@@ -1,15 +1,10 @@
 use crate::data::BpeTokenizer;
-use crate::model::{GPT, GPTConfig, GPTRecord, SamplingParams};
-use burn::{
-    config::Config,
-    module::Module,
-    record::{CompactRecorder, Recorder},
-    tensor::{Int, Tensor, backend::Backend},
-};
+use crate::model::{GPT, GPTConfig, SamplingParams};
+use burn::{config::Config, module::Module, prelude::*};
 use std::io::{self, Write};
 
-pub fn generate_text<B: Backend>(
-    device: B::Device,
+pub fn generate_text(
+    device: Device,
     artifact_dir: &str,
     prompt: &str,
     max_tokens: usize,
@@ -22,17 +17,16 @@ pub fn generate_text<B: Backend>(
     // 2. Tokenizer — BPE vocab is fixed, no artifact needed
     let tokenizer = BpeTokenizer::new();
 
-    // 3. Load Model
+    // 3. Load Model (burnpack .bpk; extensionless path auto-resolves)
     println!("Loading model from {artifact_dir}/model_final ...");
-    let record: GPTRecord<B> = CompactRecorder::new()
-        .load(format!("{}/model_final", artifact_dir).into(), &device)
+    let model = GPT::new(&config, &device)
+        .try_load_file(format!("{}/model_final", artifact_dir))
         .expect("Model checkpoint not found. Run `cargo run -- train` first.");
-
-    let model = GPT::new(&config, &device).load_record(record);
 
     // 4. Encode Prompt
     let tokens = tokenizer.encode(prompt);
-    let token_tensor = Tensor::<B, 1, Int>::from_ints(tokens.as_slice(), &device).unsqueeze::<2>();
+    let token_tensor =
+        Tensor::<1, Int>::from_ints(tokens.as_slice(), &device).unsqueeze::<2>();
 
     // 5. Generate with streaming output
     print!("{prompt}");

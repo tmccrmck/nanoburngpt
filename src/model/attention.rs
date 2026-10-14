@@ -28,7 +28,6 @@ pub struct CausalSelfAttention<B: Backend> {
     n_head: usize,
     n_kv_head: usize,
     n_embd: usize,
-    softcap: Option<f64>,
 }
 
 impl<B: Backend> CausalSelfAttention<B> {
@@ -67,10 +66,10 @@ impl<B: Backend> CausalSelfAttention<B> {
             n_head: config.n_head,
             n_kv_head,
             n_embd: config.n_embd,
-            softcap: config.softcap,
         }
     }
 
+    #[inline]
     fn split_qkv(&self, x: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>, usize, usize, usize) {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
@@ -94,6 +93,7 @@ impl<B: Backend> CausalSelfAttention<B> {
         (q, k, v, batch_size, seq_len, head_dim)
     }
 
+    #[inline]
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let (q, k, v, batch_size, seq_len, _) = self.split_qkv(x);
 
@@ -110,7 +110,6 @@ impl<B: Backend> CausalSelfAttention<B> {
         let y = attention(
             q, k, v, None, None,
             AttentionModuleOptions {
-                softcap: self.softcap,
                 is_causal: true,
                 ..Default::default()
             },
@@ -121,6 +120,7 @@ impl<B: Backend> CausalSelfAttention<B> {
         self.resid_dropout.forward(y)
     }
 
+    #[inline]
     pub fn forward_cached(
         &self,
         x: Tensor<B, 3>,
@@ -149,7 +149,6 @@ impl<B: Backend> CausalSelfAttention<B> {
         let y = attention(
             q, k_att, v_att, None, None,
             AttentionModuleOptions {
-                softcap: self.softcap,
                 is_causal: true,
                 ..Default::default()
             },
@@ -178,7 +177,6 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
-            softcap: None,
         }
     }
 
@@ -192,7 +190,6 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
-            softcap: None,
         }
     }
 
@@ -307,20 +304,5 @@ mod tests {
         let t1 = Tensor::<B, 3>::random([batch, 1, n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
         let (_, cache) = attn.forward_cached(t1, Some((cached_k, Tensor::<B, 4>::zeros([1, 2, 1, head_dim], &device))), 1);
         assert_eq!(cache.0.dims(), [1, 2, 2, head_dim], "GQA cache should have seq_len=2 after two calls");
-    }
-
-    #[test]
-    fn softcap_does_not_crash() {
-        let device = Default::default();
-        let mut config = test_config();
-        config.softcap = Some(50.0);
-        let attn = CausalSelfAttention::<B>::new(&config, &device);
-
-        let batch = 2;
-        let seq = 8;
-        let x = Tensor::<B, 3>::random([batch, seq, config.n_embd], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
-        let y = attn.forward(x);
-
-        assert_eq!(y.dims(), [batch, seq, config.n_embd]);
     }
 }

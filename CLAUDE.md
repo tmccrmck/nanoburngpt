@@ -33,7 +33,7 @@ cargo clippy
 ```
 
 ```sh
-# Unit tests (53 tests across data, datasets, presets, train, model)
+# Unit tests (47 tests across data, datasets, presets, train, model)
 cargo test
 ```
 

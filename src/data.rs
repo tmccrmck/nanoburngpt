@@ -8,19 +8,33 @@ use tiktoken_rs::r50k_base;
 pub struct TextDataset {
     pub data: Vec<usize>,
     block_size: usize,
+    max_len: Option<usize>,
 }
 
 impl TextDataset {
     pub fn new(data: Vec<usize>, block_size: usize) -> Self {
-        Self { data, block_size }
+        Self {
+            data,
+            block_size,
+            max_len: None,
+        }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn with_max_len(mut self, max_len: usize) -> Self {
+        self.max_len = Some(max_len);
+        self
+    }
+
+    fn raw_len(&self) -> usize {
         if self.data.len() <= self.block_size {
             0
         } else {
             self.data.len() - self.block_size
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.max_len.unwrap_or(usize::MAX).min(self.raw_len())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -30,7 +44,7 @@ impl TextDataset {
 
 impl Dataset<TextDatasetItem> for TextDataset {
     fn get(&self, index: usize) -> Option<TextDatasetItem> {
-        if index + self.block_size + 1 > self.data.len() {
+        if index >= self.len() {
             return None;
         }
 
@@ -74,18 +88,18 @@ pub struct TextGenerationBatch<B: Backend> {
 
 impl<B: Backend> Batcher<B, TextDatasetItem, TextGenerationBatch<B>> for TextGenerationBatcher<B> {
     fn batch(&self, items: Vec<TextDatasetItem>, device: &B::Device) -> TextGenerationBatch<B> {
-        let inputs = items
-            .iter()
-            .map(|item| Tensor::<B, 1, Int>::from_ints(item.input.as_slice(), device))
-            .collect();
+        let batch_size = items.len();
+        let mut inputs_flat = Vec::with_capacity(batch_size * self.block_size);
+        let mut targets_flat = Vec::with_capacity(batch_size * self.block_size);
+        for item in &items {
+            inputs_flat.extend_from_slice(&item.input);
+            targets_flat.extend_from_slice(&item.target);
+        }
 
-        let targets = items
-            .iter()
-            .map(|item| Tensor::<B, 1, Int>::from_ints(item.target.as_slice(), device))
-            .collect();
-
-        let inputs = Tensor::cat(inputs, 0).reshape([items.len(), self.block_size]);
-        let targets = Tensor::cat(targets, 0).reshape([items.len(), self.block_size]);
+        let inputs = Tensor::<B, 1, Int>::from_ints(inputs_flat.as_slice(), device)
+            .reshape([batch_size, self.block_size]);
+        let targets = Tensor::<B, 1, Int>::from_ints(targets_flat.as_slice(), device)
+            .reshape([batch_size, self.block_size]);
 
         TextGenerationBatch { inputs, targets }
     }
@@ -135,13 +149,42 @@ impl BpeTokenizer {
 // Generic text-file loader (dataset-agnostic)
 // ---------------------------------------------------------------------------
 
-/// Load a plain-text file, tokenize with BPE, prepend BOS token, split 90/10 train/val.
-pub fn load_text(path: &Path, block_size: usize) -> anyhow::Result<(TextDataset, TextDataset)> {
-    let text = std::fs::read_to_string(path)?;
+/// Tokenize text from a file, cache the token IDs as a `.bin` for fast reloads.
+fn tokenize_and_cache(text_path: &Path, bin_path: &Path) -> anyhow::Result<Vec<usize>> {
+    let text = std::fs::read_to_string(text_path)?;
     let tokenizer = BpeTokenizer::new();
-    let mut data = tokenizer.encode(&text);
-    // Prepend BOS token (<|endoftext|> = 50256) so the model learns sequence-start boundaries.
-    data.insert(0, BpeTokenizer::BOS_TOKEN);
+    let mut tokens = tokenizer.encode(&text);
+    tokens.insert(0, BpeTokenizer::BOS_TOKEN);
+
+    let bytes: Vec<u8> = tokens
+        .iter()
+        .flat_map(|&t| (t as u32).to_le_bytes())
+        .collect();
+    std::fs::write(bin_path, bytes)?;
+
+    Ok(tokens)
+}
+
+/// Load a pre-tokenized `.bin` file (raw u32 LE tokens).
+fn load_cached(bin_path: &Path) -> anyhow::Result<Vec<usize>> {
+    let bytes = std::fs::read(bin_path)?;
+    let tokens = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as usize)
+        .collect();
+    Ok(tokens)
+}
+
+/// Load a text file (or its cached `.bin`), tokenize with BPE, prepend BOS,
+/// split 90/10 train/val. Caches token IDs on first run — subsequent loads
+/// skip BPE encoding entirely.
+pub fn load_text(path: &Path, block_size: usize) -> anyhow::Result<(TextDataset, TextDataset)> {
+    let bin_path = path.with_extension("bin");
+    let data = if bin_path.exists() {
+        load_cached(&bin_path)?
+    } else {
+        tokenize_and_cache(path, &bin_path)?
+    };
 
     let n = data.len();
     let split = (n as f64 * 0.9) as usize;
@@ -231,6 +274,23 @@ mod tests {
         let encoded = tok.encode(text);
         let decoded = tok.decode(&encoded);
         assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn tokenize_and_cache_round_trips() {
+        let dir = std::env::temp_dir().join("nanoburngpt_test_cache");
+        std::fs::create_dir_all(&dir).ok();
+        let text_path = dir.join("test.txt");
+        let bin_path = dir.join("test.bin");
+
+        std::fs::write(&text_path, "Hello, world! This is a test.").ok();
+        let tokens = super::tokenize_and_cache(&text_path, &bin_path).unwrap();
+        let loaded = super::load_cached(&bin_path).unwrap();
+
+        assert_eq!(tokens, loaded, "cached and loaded tokens should match");
+        assert_eq!(tokens[0], BpeTokenizer::BOS_TOKEN, "BOS should be prepended");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

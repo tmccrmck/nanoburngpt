@@ -75,9 +75,6 @@ enum Commands {
         /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
         #[arg(long, default_value_t = 10000.0)]
         rope_theta: f64,
-        /// Logit softcap (Gemma-2 style tanh cap). 0.0 = disabled.
-        #[arg(long)]
-        softcap: Option<f64>,
         /// Enable mixed precision (AMP)
         #[arg(long)]
         amp: bool,
@@ -129,7 +126,6 @@ where
             warmup_iters,
             max_train_items,
             rope_theta,
-            softcap,
             amp,
             grad_accum_steps,
         } => {
@@ -147,7 +143,6 @@ where
                 block_size: block_size.unwrap_or(preset_cfg.block_size),
                 dropout,
                 rope_theta,
-                softcap,
             };
 
             let dataset_enum = Dataset::from_str(&dataset)
@@ -189,6 +184,7 @@ where
                 temperature,
                 top_k,
                 top_p,
+                repetition_penalty: 1.0,
             };
             println!("Generating text on device: {:?}", device);
             generate_text::<B>(device, &artifact_dir, &prompt, max_tokens, &sampling);

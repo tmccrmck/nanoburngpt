@@ -1,5 +1,5 @@
 use burn::{
-    tensor::{activation, backend::Backend, Int, Tensor},
+    tensor::{activation, backend::Backend, IndexingUpdateOp, Int, Tensor},
 };
 use rand::distr::{Distribution, weighted::WeightedIndex};
 
@@ -12,6 +12,10 @@ pub struct SamplingParams {
     /// Nucleus sampling: keep the smallest set of tokens whose cumulative
     /// probability exceeds top_p. 1.0 = disabled.
     pub top_p: f64,
+    /// Repetition penalty: > 1.0 penalizes tokens that have already appeared.
+    /// Applied as logit / penalty for each previous occurrence.
+    /// 1.0 = disabled.
+    pub repetition_penalty: f64,
 }
 
 impl Default for SamplingParams {
@@ -20,17 +24,34 @@ impl Default for SamplingParams {
             temperature: 0.8,
             top_k: 0,
             top_p: 1.0,
+            repetition_penalty: 1.0,
         }
     }
 }
 
 /// Sample next token from logits [batch, vocab], returns [batch, 1] int tensor.
+/// `prev_tokens` [batch, seq_len] contains all tokens generated so far (for repetition penalty).
+#[inline]
 pub(crate) fn sample_token<B: Backend>(
     logits: &Tensor<B, 2>,
     params: &SamplingParams,
+    prev_tokens: &Tensor<B, 2, Int>,
 ) -> Tensor<B, 2, Int> {
     let [batch, vocab] = logits.dims();
     let device = logits.device();
+
+    let logits = if params.repetition_penalty > 1.0 + 1e-6 {
+        let [_, seq_len] = prev_tokens.dims();
+        let ones = Tensor::<B, 2>::ones([batch, seq_len], &device);
+        let counts = Tensor::<B, 2>::zeros([batch, vocab], &device)
+            .scatter(1, prev_tokens.clone(), ones, IndexingUpdateOp::Add);
+        let penalty = 1.0 / params.repetition_penalty;
+        let mask = Tensor::<B, 2>::ones([batch, vocab], &device)
+            - (1.0 - penalty) * counts.clamp(0.0, 1.0);
+        logits.clone() * mask
+    } else {
+        logits.clone()
+    };
 
     if params.temperature < 1e-6 {
         logits.clone().argmax(1).unsqueeze::<2>()
@@ -72,31 +93,43 @@ pub(crate) fn sample_token<B: Backend>(
 
 /// Apply top-k and top-p filtering to a probability distribution, returning
 /// a new distribution with excluded tokens zeroed out and probabilities renormalized.
-pub(crate) fn filter_top_k_p(probs: &[f32], top_k: usize, top_p: f64) -> Vec<f32> {
+#[inline]
+pub fn filter_top_k_p(probs: &[f32], top_k: usize, top_p: f64) -> Vec<f32> {
     let vocab = probs.len();
 
-    // Sort indices by descending probability
     let mut indices: Vec<usize> = (0..vocab).collect();
-    indices.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
 
-    let mut cutoff = vocab;
+    // Determine an upper bound on how many tokens we need sorted.
+    // If top-k is active, we never need more than top_k entries.
+    let bound = if top_k > 0 && top_k < vocab { top_k } else { vocab };
 
-    // Top-k: keep at most top_k tokens
-    if top_k > 0 && top_k < vocab {
-        cutoff = top_k;
-    }
+    let cutoff = if top_p < 1.0 {
+        // Partial sort up to bound, then sort just the first bound elements.
+        if bound < vocab {
+            indices.select_nth_unstable_by(bound, |&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            indices[..bound].sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        } else {
+            indices.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        }
 
-    // Top-p (nucleus): keep smallest set with cumulative prob >= top_p
-    if top_p < 1.0 {
         let mut cumsum = 0.0_f64;
+        let mut cutoff = bound;
         for (i, &idx) in indices.iter().enumerate() {
             cumsum += probs[idx] as f64;
             if cumsum >= top_p {
-                cutoff = cutoff.min(i + 1);
+                cutoff = i + 1;
                 break;
             }
         }
-    }
+        cutoff
+    } else {
+        // Pure top-k: partial sort only.
+        if bound < vocab {
+            indices.select_nth_unstable_by(bound, |&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            indices[..bound].sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        }
+        bound
+    };
 
     // Zero out tokens outside the cutoff
     let mut result = vec![0.0f32; vocab];

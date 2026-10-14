@@ -1,5 +1,5 @@
 use crate::{
-    data::{BpeTokenizer, TextDataset, TextGenerationBatch, TextGenerationBatcher, load_text},
+    data::{BpeTokenizer, TextGenerationBatch, TextGenerationBatcher, load_text},
     datasets::Dataset,
     model::{GPT, GPTConfig},
 };
@@ -174,10 +174,7 @@ pub fn run_training<B: AutodiffBackend>(
 
     // Optionally cap the training set for smoke tests
     let train_dataset = if training_config.max_train_items > 0 {
-        let cap = training_config
-            .max_train_items
-            .min(train_dataset.data.len());
-        TextDataset::new(train_dataset.data[..cap].to_vec(), gpt_config.block_size)
+        train_dataset.with_max_len(training_config.max_train_items)
     } else {
         train_dataset
     };
@@ -209,7 +206,6 @@ pub fn run_training<B: AutodiffBackend>(
 
     let dataloader_val = DataLoaderBuilder::new(batcher_val)
         .batch_size(training_config.batch_size)
-        .shuffle(1337)
         .num_workers(training_config.num_workers)
         .build(val_dataset);
 
@@ -269,6 +265,7 @@ pub fn run_training<B: AutodiffBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::TextDataset;
     use burn::backend::Autodiff;
     use burn::data::dataloader::Dataset as BurnDataset;
     use burn::data::dataloader::batcher::Batcher;
@@ -371,7 +368,6 @@ mod tests {
             block_size,
             dropout: 0.0,
             rope_theta: 10000.0,
-            softcap: None,
         };
         let mut model = GPT::<B>::new(&config, &device);
 

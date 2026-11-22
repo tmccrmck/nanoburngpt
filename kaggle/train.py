@@ -11,7 +11,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 REPO_URL = "https://github.com/tmccrmck/nanoburngpt.git"
-BRANCH = "burn-0.22-colab"
+BRANCH = "main"
 
 MODEL = "nano"
 DATASET = "shakespeare"

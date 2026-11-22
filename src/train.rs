@@ -19,6 +19,7 @@ use burn::{
         checkpoint::MetricCheckpointingStrategy,
         metric::store::{Aggregate, Direction, Split},
         metric::{AccuracyMetric, LossMetric, PerplexityMetric},
+        renderer::CliMetricsRenderer,
     },
 };
 
@@ -49,6 +50,9 @@ pub struct TrainingConfig {
     /// Gradient accumulation steps (1 = no accumulation)
     #[config(default = 1)]
     pub grad_accum_steps: usize,
+    /// Disable the interactive TUI and use plain CLI progress output
+    #[config(default = false)]
+    pub no_tui: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +246,7 @@ pub fn run_training(
         Split::Valid,
     );
 
-    let result = SupervisedTraining::new("artifacts", dataloader_train, dataloader_val)
+    let mut training = SupervisedTraining::new("artifacts", dataloader_train, dataloader_val)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
         .metric_train_numeric(AccuracyMetric::new())
@@ -253,8 +257,13 @@ pub fn run_training(
         .with_checkpointing_strategy(strategy)
         .num_epochs(training_config.num_epochs)
         .grads_accumulation(training_config.grad_accum_steps)
-        .summary()
-        .launch(learner);
+        .summary();
+
+    if training_config.no_tui || cfg!(not(feature = "tui")) {
+        training = training.renderer(Box::new(CliMetricsRenderer::new()));
+    }
+
+    let result = training.launch(learner);
 
     if let Some(err) = &result.error {
         eprintln!("Training failed: {err:?}");

@@ -4,20 +4,25 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "tui"]
 wgpu = ["burn/wgpu"]
 cuda = ["burn/cuda"]
 cpu = ["burn/flex"]
+# Enables the interactive ratatui dashboard during training. Disabling this
+# feature (e.g. `--no-default-features --features cuda`) forces Burn's plain
+# CliMetricsRenderer in `src/train.rs` while keeping `burn`'s default features
+# (kernel fusion, autotune, cubecl stdlib) intact.
+tui = ["burn/tui"]
 
 [dependencies]
 anyhow = "1.0.102"
-burn = { version = "0.22.0", features = ["train", "tui", "flex"] }
+burn = { version = "0.22.1", features = ["train", "flex"] }
 clap = { version = "4.6.0", features = ["derive"] }
 rand = "0.10.0"
 reqwest = { version = "0.13.2", features = ["blocking"] }
 tiktoken-rs = "0.9.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-burn-flex = "0.22.0"
+burn-flex = "0.22.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

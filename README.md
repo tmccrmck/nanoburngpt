@@ -47,6 +47,7 @@ Options:
   --rope-theta <F>        RoPE frequency base           [default: 10000.0]
   --softcap <F>           Logit softcap (Gemma-2 style) [default: disabled]
   --amp                   Enable mixed precision (f16)
+  --no-tui                Disable interactive TUI; print plain CLI logs
 ```
 
 Saves `artifacts/model_final.mpk` and `artifacts/config.json` on completion.
@@ -117,6 +118,9 @@ cargo run --release --features cuda -- train \
 
 **Using the Helper Script:**
 The `run_cloud.sh` script is the default entry point for the Docker image. It defaults to training `gpt2-small` on `wikitext103`.
+
+### 3. Run on Google Colab
+Open [`colab.ipynb`](colab.ipynb) in Google Colab with a GPU runtime (**Runtime → Change runtime type → GPU**). The notebook installs Rust, builds the CUDA-only binary without the TUI (`--no-default-features --features cuda`), overrides LTO settings (`CARGO_PROFILE_RELEASE_LTO=thin` and `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`) to stay within Colab's system RAM limit, and runs training with `--no-tui` for clean notebook output.
 
 ### Architecture
 

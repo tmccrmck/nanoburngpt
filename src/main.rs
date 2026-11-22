@@ -78,6 +78,10 @@ enum Commands {
         /// Gradient accumulation steps (simulates larger batch size with less memory)
         #[arg(long, default_value_t = 1)]
         grad_accum_steps: usize,
+        /// Disable the interactive TUI and print plain CLI progress logs
+        /// (recommended for notebooks like Google Colab and non-TTY log capture)
+        #[arg(long)]
+        no_tui: bool,
     },
     Generate {
         #[arg(long, default_value = "artifacts")]
@@ -141,6 +145,7 @@ fn main() {
             rope_theta,
             amp,
             grad_accum_steps,
+            no_tui,
         } => {
             let preset = model
                 .parse::<ModelPreset>()
@@ -170,6 +175,7 @@ fn main() {
                 max_train_items,
                 amp,
                 grad_accum_steps,
+                no_tui,
             };
 
             println!(

@@ -6,34 +6,11 @@ use burn::{
     module::Module,
     nn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, Linear, LinearConfig,
+        RmsNorm, RmsNormConfig,
     },
     prelude::*,
     tensor::activation,
 };
-
-/// RMSNorm — no learnable bias or mean subtraction.
-/// Formula: `x * weight / sqrt(mean(x^2) + eps)`.
-#[derive(Module, Debug)]
-pub struct RMSNorm {
-    weight: Tensor<1>,
-    eps: f64,
-}
-
-impl RMSNorm {
-    pub fn new(d_model: usize, device: &Device) -> Self {
-        Self {
-            weight: Tensor::ones([d_model], device),
-            eps: 1e-5,
-        }
-    }
-
-    #[inline]
-    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
-        let mean_square = x.clone().powf_scalar(2).mean_dim(D - 1);
-        let rms = (mean_square + self.eps).sqrt();
-        x / rms * self.weight.clone().unsqueeze::<D>()
-    }
-}
 
 pub use self::attention::{CausalSelfAttention, KVCache, LayerKV};
 use self::sampling::sample_token;
@@ -95,18 +72,18 @@ impl MLP {
 
 #[derive(Module, Debug)]
 pub struct Block {
-    ln_1: RMSNorm,
+    ln_1: RmsNorm,
     attn: CausalSelfAttention,
-    ln_2: RMSNorm,
+    ln_2: RmsNorm,
     mlp: MLP,
 }
 
 impl Block {
     pub fn new(config: &GPTConfig, device: &Device) -> Self {
         Self {
-            ln_1: RMSNorm::new(config.n_embd, device),
+            ln_1: RmsNormConfig::new(config.n_embd).init(device),
             attn: CausalSelfAttention::new(config, device),
-            ln_2: RMSNorm::new(config.n_embd, device),
+            ln_2: RmsNormConfig::new(config.n_embd).init(device),
             mlp: MLP::new(config, device),
         }
     }
@@ -137,18 +114,23 @@ impl Block {
 pub struct GPT {
     token_embedding: Embedding,
     blocks: Vec<Block>,
-    ln_f: RMSNorm,
+    ln_f: RmsNorm,
 }
 
 impl GPT {
     pub fn new(config: &GPTConfig, device: &Device) -> Self {
-        let token_embedding = EmbeddingConfig::new(config.vocab_size, config.n_embd).init(device);
+        let token_embedding = EmbeddingConfig::new(config.vocab_size, config.n_embd)
+            .with_initializer(Initializer::Normal {
+                mean: 0.0,
+                std: 0.02,
+            })
+            .init(device);
 
         let blocks = (0..config.n_layer)
             .map(|_| Block::new(config, device))
             .collect();
 
-        let ln_f = RMSNorm::new(config.n_embd, device);
+        let ln_f = RmsNormConfig::new(config.n_embd).init(device);
 
         Self {
             token_embedding,
@@ -223,14 +205,23 @@ impl GPT {
         block_size: usize,
         mut on_token: impl FnMut(i32),
     ) -> Tensor<2, Int> {
-        let [batch, prompt_len] = idx.dims();
+        let [batch, orig_prompt_len] = idx.dims();
+        let idx = if orig_prompt_len > block_size {
+            idx.slice([0..batch, (orig_prompt_len - block_size)..orig_prompt_len])
+        } else {
+            idx
+        };
+        let [_, prompt_len] = idx.dims();
+        let steps = max_new_tokens.min(block_size.saturating_sub(prompt_len));
+        if steps == 0 {
+            return idx;
+        }
 
-        let (logits, mut cache) = self.forward_cached(idx.clone(), None);
-        let mut next_logits = logits;
+        let (mut next_logits, mut cache) = self.forward_cached(idx.clone(), None);
         let mut prev_tokens = idx.clone();
-        let mut generated: Vec<Tensor<2, Int>> = Vec::new();
+        let mut generated: Vec<Tensor<2, Int>> = Vec::with_capacity(steps);
 
-        for _ in 0..max_new_tokens {
+        for step in 0..steps {
             let [_, len, vocab] = next_logits.dims();
             let logits = next_logits
                 .slice([0..batch, len - 1..len, 0..vocab])
@@ -238,29 +229,23 @@ impl GPT {
 
             let idx_next = sample_token(&logits, sampling, &prev_tokens);
 
-            let token_id: i32 = idx_next.clone().into_scalar();
+            let token_id: i32 = idx_next.clone().slice([0..1, 0..1]).into_scalar();
             on_token(token_id);
 
-            let total_len = prompt_len + generated.len() + 1;
-            if total_len > block_size {
+            generated.push(idx_next.clone());
+            if step + 1 == steps {
                 break;
             }
-
-            generated.push(idx_next.clone());
             prev_tokens = Tensor::cat(vec![prev_tokens, idx_next.clone()], 1);
             let (step_logits, new_cache) = self.forward_cached(idx_next, Some(cache));
             next_logits = step_logits;
             cache = new_cache;
         }
 
-        if generated.is_empty() {
-            idx
-        } else {
-            let mut all = Vec::with_capacity(1 + generated.len());
-            all.push(idx);
-            all.extend(generated);
-            Tensor::cat(all, 1)
-        }
+        let mut all = Vec::with_capacity(1 + generated.len());
+        all.push(idx);
+        all.extend(generated);
+        Tensor::cat(all, 1)
     }
 }
 
@@ -447,5 +432,115 @@ mod tests {
             "GQA KV cache logits differ from full forward pass: {}",
             diff_val
         );
+    }
+
+    #[test]
+    fn initial_loss_matches_uniform_vocab() {
+        use burn::nn::loss::CrossEntropyLossConfig;
+
+        let device = test_device();
+        let vocab_size = 1000;
+        let seq_len = 16;
+        let config = GPTConfig {
+            vocab_size,
+            n_layer: 2,
+            n_head: 4,
+            n_embd: 64,
+            n_kv_head: None,
+            block_size: seq_len,
+            dropout: 0.0,
+            rope_theta: 10000.0,
+        };
+        let gpt = GPT::new(&config, &device);
+
+        let inputs = Tensor::<2, Int>::zeros([2, seq_len], &device);
+        let targets = Tensor::<2, Int>::zeros([2, seq_len], &device);
+        let logits = gpt.forward(inputs).reshape([2 * seq_len, vocab_size]);
+        let loss: f32 = CrossEntropyLossConfig::new()
+            .init(&device)
+            .forward(logits, targets.reshape([2 * seq_len]))
+            .into_scalar();
+
+        // ln(1000) ~= 6.91; with std=0.02 init, loss should be near uniform entropy
+        assert!(
+            loss > 5.5 && loss < 8.5,
+            "expected initial loss near ln(1000)=6.91, got {loss}"
+        );
+    }
+
+    #[test]
+    fn rmsnorm_weights_are_trainable_params() {
+        let device = test_device();
+        let config = create_test_config();
+        let gpt = GPT::new(&config, &device);
+
+        let emb = config.vocab_size * config.n_embd;
+        let block_params = config.n_embd * (3 * config.n_embd)
+            + config.n_embd * config.n_embd
+            + config.n_embd * (4 * config.n_embd)
+            + (4 * config.n_embd) * config.n_embd
+            + 2 * config.n_embd;
+        let expected = emb + config.n_layer * block_params + config.n_embd;
+        assert_eq!(gpt.num_params(), expected);
+    }
+
+    #[test]
+    fn generate_callback_matches_generated_count_at_block_size() {
+        let device = test_device();
+        let config = create_test_config();
+        let gpt = GPT::new(&config, &device);
+
+        let prompt_len = 14;
+        let max_new = 10;
+        let prompt = Tensor::<2, Int>::zeros([1, prompt_len], &device);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+
+        let mut callback_count = 0usize;
+        let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {
+            callback_count += 1;
+        });
+        assert_eq!(output.dims(), [1, config.block_size]);
+        assert_eq!(callback_count, config.block_size - prompt_len);
+    }
+
+    #[test]
+    fn generate_crops_prompt_exceeding_block_size() {
+        let device = test_device();
+        let config = create_test_config();
+        let gpt = GPT::new(&config, &device);
+
+        let prompt = Tensor::<2, Int>::zeros([1, config.block_size + 4], &device);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+
+        let output = gpt.generate(prompt, 5, &sampling, config.block_size, |_| {});
+        assert_eq!(output.dims(), [1, config.block_size]);
+    }
+
+    #[test]
+    fn generate_supports_batch_gt_one() {
+        let device = test_device();
+        let config = create_test_config();
+        let gpt = GPT::new(&config, &device);
+
+        let prompt = Tensor::<2, Int>::zeros([2, 3], &device);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+
+        let output = gpt.generate(prompt, 4, &sampling, config.block_size, |_| {});
+        assert_eq!(output.dims(), [2, 7]);
     }
 }

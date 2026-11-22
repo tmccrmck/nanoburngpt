@@ -4,7 +4,7 @@ For AI agents and developers working on this codebase.
 
 ## Goal
 
-**NanoGPT** (decoder-only Transformer) trained on Shakespeare or WikiText-103, implemented with the **Rust Burn 0.21** deep learning framework and `wgpu` (Metal) backend.
+**NanoGPT** (decoder-only Transformer) trained on Shakespeare or WikiText-103, implemented with the **Rust Burn 0.22** deep learning framework (`wgpu` Metal on macOS, `cuda` for NVIDIA GPUs, `flex` on CPU).
 
 Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 
@@ -13,8 +13,8 @@ Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 | Component   | Choice                                      |
 |-------------|---------------------------------------------|
 | Language    | Rust (edition 2024)                         |
-| ML framework| [Burn 0.21.0](https://burn.dev/)            |
-| Backend     | `wgpu` (cross-platform GPU, Metal on macOS) |
+| ML framework| [Burn 0.22.1](https://burn.dev/)            |
+| Backend     | `wgpu` (Metal), `cuda` (NVIDIA), `flex` (CPU) |
 | Dataset     | Shakespeare / WikiText-103 (BPE tokenized)  |
 | CLI         | `clap`                                      |
 | Tokenizer   | `tiktoken-rs` (GPT-2 BPE r50k_base)         |
@@ -27,7 +27,7 @@ Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 | `src/main.rs`      | CLI entry point (`train` / `generate` subcommands)   |
 | `src/lib.rs`       | Module declarations                                  |
 | `src/data.rs`      | `BpeTokenizer`, `TextDataset`, `TextGenerationBatcher` |
-| `src/model/mod.rs`      | `GPTConfig`, `GPT`, `Block`, `MLP`, `RMSNorm`                |
+| `src/model/mod.rs`      | `GPTConfig`, `GPT`, `Block`, `MLP` (`burn::nn::RmsNorm`)     |
 | `src/model/attention.rs`| `CausalSelfAttention`, `KVCache`, `LayerKV`                  |
 | `src/model/sampling.rs` | `SamplingParams`, `sample_token`, `filter_top_k_p`           |
 | `src/train.rs`     | `TrainStep`, `InferenceStep`, `run_training`         |
@@ -40,9 +40,13 @@ The full pipeline compiles and runs end-to-end:
 - `cargo run -- train` downloads data, trains, saves model
 - `cargo run -- generate` loads model and generates text
 
-## Burn 0.21 API Notes
+## Burn 0.22 API Notes
 
-Several API changes from older Burn versions were resolved during implementation. Keep these in mind when updating:
+Several API changes in Burn 0.22 are reflected in this codebase:
+
+**Generic-free `Device` API**
+- `Tensor<D>`, `Module`, `GPT`, and `Device` no longer take a backend generic parameter `B`.
+- Select devices at runtime via `Device::cuda(0)`, `Device::wgpu(...)`, or `Device::flex()`, and wrap with `.autodiff()` for training.
 
 **Learner / training loop**
 - No `LearnerBuilder`. Use `Learner::new(model, optim, lr)` + `SupervisedTraining::new(dir, dl_train, dl_val)...launch(learner)`.
@@ -55,12 +59,11 @@ Several API changes from older Burn versions were resolved during implementation
 - `unsqueeze` similarly requires a const-generic: `unsqueeze::<D2>()`.
 - `TensorData` fields are `bytes`, `shape`, `dtype` — no `.value`. Use `.as_slice::<T>()` to read values.
 
-**Wgpu backend**
-- `Wgpu<f32, i32>` — the `AutoGraphicsApi` type parameter was removed.
-- `#![recursion_limit = "512"]` is required in `main.rs` due to deep `Sync` trait evaluation chains in `wgpu-core 26.x`.
+**Recursion limit**
+- `#![recursion_limit = "512"]` is required in `main.rs` due to deep `Sync` trait evaluation chains in `wgpu-core`.
 
 **Dropout**
-- `Dropout::forward` is a no-op when `B::ad_enabled() == false` (i.e. on non-autodiff backends). Inference is automatically correct — no explicit eval mode needed.
+- `Dropout::forward` is a no-op when not in autodiff mode. Inference is automatically correct — no explicit eval mode needed.
 
 ## LR Schedule
 
@@ -99,9 +102,8 @@ Training writes to `artifacts/` (gitignored):
 ```
 artifacts/
   config.json          GPTConfig (vocab size, architecture)
-  model_final.mpk      Final trained weights (CompactRecorder)
+  model_final.bpk      Final trained weights (Burnpack)
   checkpoint/          Per-epoch checkpoints (model, optim, scheduler)
-  experiment.log       Training log
   train/               Training metric CSVs
   valid/               Validation metric CSVs
 ```
@@ -126,4 +128,4 @@ cargo run --release -- generate --prompt "HAMLET:" --temperature 0.8
 
 - [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT)
 - [The Burn Book](https://burn.dev/book/)
-- [Burn API docs](https://docs.rs/burn/0.21.0/burn/)
+- [Burn API docs](https://docs.rs/burn/0.22.1/burn/)

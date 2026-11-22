@@ -30,6 +30,35 @@ impl Default for SamplingParams {
     }
 }
 
+/// Apply HuggingFace-style repetition penalty to logits for tokens present in `prev_tokens`:
+/// positive logits are divided by `penalty`, negative logits are multiplied by `penalty`.
+#[inline]
+pub(crate) fn apply_repetition_penalty(
+    logits: &Tensor<2>,
+    prev_tokens: &Tensor<2, Int>,
+    penalty: f64,
+) -> Tensor<2> {
+    if penalty <= 1.0 + 1e-6 {
+        return logits.clone();
+    }
+    let [batch, vocab] = logits.dims();
+    let [_, seq_len] = prev_tokens.dims();
+    if seq_len == 0 {
+        return logits.clone();
+    }
+    let device = logits.device();
+    let ones = Tensor::<2>::ones([batch, seq_len], &device);
+    let seen = Tensor::<2>::zeros([batch, vocab], &device)
+        .scatter(1, prev_tokens.clone(), ones, IndexingUpdateOp::Add)
+        .greater_elem(0.0);
+
+    let pos_mask = logits.clone().greater_elem(0.0);
+    let penalized = logits.clone().mask_where(pos_mask, logits.clone() / penalty);
+    let neg_mask = logits.clone().lower_elem(0.0);
+    let penalized = penalized.mask_where(neg_mask, logits.clone() * penalty);
+    logits.clone().mask_where(seen, penalized)
+}
+
 /// Sample next token from logits [batch, vocab], returns [batch, 1] int tensor.
 /// `prev_tokens` [batch, seq_len] contains all tokens generated so far (for repetition penalty).
 #[inline]
@@ -41,18 +70,7 @@ pub(crate) fn sample_token(
     let [batch, vocab] = logits.dims();
     let device = logits.device();
 
-    let logits = if params.repetition_penalty > 1.0 + 1e-6 {
-        let [_, seq_len] = prev_tokens.dims();
-        let ones = Tensor::<2>::ones([batch, seq_len], &device);
-        let counts = Tensor::<2>::zeros([batch, vocab], &device)
-            .scatter(1, prev_tokens.clone(), ones, IndexingUpdateOp::Add);
-        let penalty = 1.0 / params.repetition_penalty;
-        let mask = Tensor::<2>::ones([batch, vocab], &device)
-            - (1.0 - penalty) * counts.clamp(0.0, 1.0);
-        logits.clone() * mask
-    } else {
-        logits.clone()
-    };
+    let logits = apply_repetition_penalty(logits, prev_tokens, params.repetition_penalty);
 
     if params.temperature < 1e-6 {
         logits.clone().argmax(1).unsqueeze::<2>()
@@ -107,10 +125,10 @@ pub fn filter_top_k_p(probs: &[f32], top_k: usize, top_p: f64) -> Vec<f32> {
     let cutoff = if top_p < 1.0 {
         // Partial sort up to bound, then sort just the first bound elements.
         if bound < vocab {
-            indices.select_nth_unstable_by(bound, |&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-            indices[..bound].sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            indices.select_nth_unstable_by(bound, |&a, &b| probs[b].total_cmp(&probs[a]));
+            indices[..bound].sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
         } else {
-            indices.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            indices.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
         }
 
         let mut cumsum = 0.0_f64;
@@ -126,8 +144,8 @@ pub fn filter_top_k_p(probs: &[f32], top_k: usize, top_p: f64) -> Vec<f32> {
     } else {
         // Pure top-k: partial sort only.
         if bound < vocab {
-            indices.select_nth_unstable_by(bound, |&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-            indices[..bound].sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            indices.select_nth_unstable_by(bound, |&a, &b| probs[b].total_cmp(&probs[a]));
+            indices[..bound].sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
         }
         bound
     };
@@ -208,5 +226,28 @@ mod tests {
         assert!((result[1] - 1.0).abs() < 1e-5, "expected 1.0, got {}", result[1]);
         assert_eq!(result[2], 0.0);
         assert_eq!(result[3], 0.0);
+    }
+
+    #[test]
+    fn repetition_penalty_lowers_both_positive_and_negative_logits() {
+        use burn::prelude::*;
+
+        let device = Device::flex();
+        let logits = Tensor::<2>::from_data([[4.0_f32, -4.0, 2.0, -2.0]], &device);
+        let prev_tokens = Tensor::<2, Int>::from_data([[0_i32, 1]], &device);
+        let penalized = super::apply_repetition_penalty(&logits, &prev_tokens, 2.0);
+        let data = penalized.to_data();
+        let vals = data.as_slice::<f32>().unwrap();
+        assert!((vals[0] - 2.0).abs() < 1e-5, "pos seen: {}", vals[0]);
+        assert!((vals[1] - (-8.0)).abs() < 1e-5, "neg seen: {}", vals[1]);
+        assert!((vals[2] - 2.0).abs() < 1e-5, "pos unseen: {}", vals[2]);
+        assert!((vals[3] - (-2.0)).abs() < 1e-5, "neg unseen: {}", vals[3]);
+    }
+
+    #[test]
+    fn filter_top_k_p_handles_nan_without_panicking() {
+        let probs = vec![0.5, f32::NAN, 0.3, 0.2];
+        let result = filter_top_k_p(&probs, 2, 0.9);
+        assert_eq!(result.len(), probs.len());
     }
 }

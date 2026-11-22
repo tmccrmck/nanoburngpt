@@ -26,10 +26,10 @@ impl TextDataset {
     }
 
     fn raw_len(&self) -> usize {
-        if self.data.len() <= self.block_size {
+        if self.block_size == 0 || self.data.len() <= self.block_size {
             0
         } else {
-            self.data.len() - self.block_size
+            (self.data.len() - 1) / self.block_size
         }
     }
 
@@ -48,7 +48,8 @@ impl Dataset<TextDatasetItem> for TextDataset {
             panic!("TextDataset index out of bounds: {index} >= {}", self.len());
         }
 
-        let chunk = &self.data[index..index + self.block_size + 1];
+        let start = index * self.block_size;
+        let chunk = &self.data[start..start + self.block_size + 1];
         let input = chunk[..self.block_size].to_vec();
         let target = chunk[1..].to_vec();
 
@@ -206,10 +207,22 @@ mod tests {
     }
 
     #[test]
-    fn len_is_tokens_minus_block_size() {
+    fn len_is_non_overlapping_chunks() {
         let ds = make_dataset(10, 3);
-        // 10 - 3 = 7 valid windows
-        assert_eq!(ds.len(), 7);
+        // 10 tokens with block_size=3 -> (10 - 1) / 3 = 3 chunks: [0..4], [3..7], [6..10]
+        assert_eq!(ds.len(), 3);
+        assert_eq!(make_dataset(4, 3).len(), 1);
+    }
+
+    #[test]
+    fn chunks_are_non_overlapping() {
+        let ds = make_dataset(10, 3);
+        assert_eq!(ds.get(0).unwrap().input, vec![0, 1, 2]);
+        assert_eq!(ds.get(0).unwrap().target, vec![1, 2, 3]);
+        assert_eq!(ds.get(1).unwrap().input, vec![3, 4, 5]);
+        assert_eq!(ds.get(1).unwrap().target, vec![4, 5, 6]);
+        assert_eq!(ds.get(2).unwrap().input, vec![6, 7, 8]);
+        assert_eq!(ds.get(2).unwrap().target, vec![7, 8, 9]);
     }
 
     #[test]

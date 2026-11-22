@@ -20,9 +20,9 @@ cargo run --release -- train --dataset shakespeare --model nano
 # Full training (Shakespeare, GPT-2 small)
 cargo run --release -- train --dataset shakespeare --model gpt2-small
 
-# Cloud GPU training (CUDA backend)
-cargo run --release --features cuda -- train \
-  --dataset wikitext103 --model gpt2-small
+# Cloud GPU training (CUDA backend, no TUI/wgpu)
+cargo run --release --no-default-features --features cuda -- train \
+  --dataset wikitext103 --model gpt2-small --no-tui
 
 # Generate text
 cargo run --release -- generate --prompt "HAMLET:" --temperature 0.8
@@ -39,34 +39,34 @@ cargo test
 
 ## Architecture
 
-Decoder-only Transformer (nanoGPT style) implemented with [Burn 0.21](https://burn.dev/) and the `wgpu` (Metal) backend.
+Decoder-only Transformer (nanoGPT style) implemented with [Burn 0.22.1](https://burn.dev/) (generic-free `Device` API; `wgpu` Metal default on macOS, `cuda` for NVIDIA GPUs, `flex` for CPU).
 
 **Data flow:**
-1. `data.rs` — `load_text` reads a pre-downloaded text file, tokenizes with `BpeTokenizer` (tiktoken-rs r50k_base, vocab_size=50257), splits 90/10 into `TextDataset` (train/val), and `TextGenerationBatcher` collates samples into `TextGenerationBatch` (inputs/targets shifted by 1)
-2. `model/` — `GPT::forward` runs token embeddings → N × `Block` (RMSNorm → `CausalSelfAttention` with RoPE → RMSNorm → `MLP`) → final RMSNorm → weight-tied output projection. Attention uses Burn's fused SDPA kernel (`burn::tensor::module::attention`) with `is_causal: true` — no explicit mask tensor. `GPT::generate` uses KV caching via `GPT::forward_cached` — prefills the prompt, then decodes one token at a time reusing cached K/V tensors
-3. `train.rs` — `GPT::forward_classification` flattens `[batch, seq, vocab]` → `[batch*seq, vocab]` for cross-entropy. `run_training` wires together Burn's `Learner::new` + `SupervisedTraining::new(...).launch(learner)`. `WarmupCosineScheduler` implements the nanoGPT LR schedule (Burn's `ComposedLrScheduler` combines in parallel, not sequentially, so a custom impl was required)
-4. `inference.rs` — loads `artifacts/config.json` and `artifacts/model_final.mpk`, creates `BpeTokenizer::new()`, encodes prompt, calls `GPT::generate`, decodes output
+1. `data.rs` — `load_text` reads a pre-downloaded text file, tokenizes with `BpeTokenizer` (tiktoken-rs r50k_base, vocab_size=50257), splits 90/10 into `TextDataset` (non-overlapping chunks of length `block_size`), and `TextGenerationBatcher` collates samples into `TextGenerationBatch` (inputs/targets shifted by 1)
+2. `model/` — `GPT::forward` runs token embeddings (`Normal(0, 0.02)`) → N × `Block` (`RmsNorm` → `CausalSelfAttention` with RoPE → `RmsNorm` → `MLP`) → final `RmsNorm` → weight-tied output projection. Attention uses Burn's fused SDPA kernel (`burn::tensor::module::attention`) with `is_causal: true` — no explicit mask tensor. `GPT::generate` uses KV caching via `GPT::forward_cached` — prefills the prompt, then decodes one token at a time reusing cached K/V tensors
+3. `train.rs` — `GPT::forward_classification` flattens `[batch, seq, vocab]` → `[batch*seq, vocab]` for cross-entropy. `run_training` wires together Burn's `Learner::new` + `SupervisedTraining::new(...).launch(learner)` (with `--no-tui` / non-`tui` feature using `CliMetricsRenderer` and `with_application_logger(None)`). `WarmupCosineScheduler` implements the nanoGPT LR schedule (Burn's `ComposedLrScheduler` combines in parallel, not sequentially, so a custom impl was required)
+4. `inference.rs` — loads `artifacts/config.json` and `artifacts/model_final.bpk`, creates `BpeTokenizer::new()`, encodes prompt, calls `GPT::generate`, decodes output
 5. `datasets.rs` — `Dataset` enum (Shakespeare, WikiText103); `ensure_downloaded` fetches and preprocesses on first use, caches to `data/<name>/input.txt`
 6. `presets.rs` — `ModelPreset` enum (nano, gpt2-small/medium/large/xl); `config()` returns a `GPTConfig` with all architectural parameters pre-filled
 
 **Metrics:** Tracks loss, accuracy, and perplexity (exp(loss)) for both train and validation. Perplexity is the standard LM evaluation metric — lower is better. `MetricCheckpointingStrategy` saves only the best checkpoint by validation perplexity.
 
-**Artifacts** written to `artifacts/` (gitignored): `config.json`, `model_final.mpk`, best-epoch checkpoint, metric CSVs, `experiment.log`.
+**Artifacts** written to `artifacts/` (gitignored): `config.json`, `model_final.bpk`, best-epoch checkpoint, metric CSVs.
 
-## Burn 0.21 API
+## Burn 0.22 API
 
 Keep these in mind when modifying training or model code:
 
+- **Generic-free `Device` API**: Burn 0.22 removes backend type parameters (`B`) from `Tensor<D>`, `Module`, `GPT`, and `Device` (`Device::cuda(0)`, `Device::wgpu(...)`, `Device::flex()`, `device.autodiff()`).
 - **Training loop**: `Learner::new(model, optim, lr_scheduler)` + `SupervisedTraining::new(dir, dl_train, dl_val)...launch(learner)`. There is no `LearnerBuilder`.
-- **`squeeze`**: Takes zero arguments but requires a const-generic output rank: `squeeze::<D>()`. It removes **all** size-1 dims simultaneously — use `reshape([...])` when multiple dims might be size 1 (e.g. batch=1 during inference).
+- **`squeeze` / `unsqueeze`**: Require a const-generic output rank: `squeeze::<D>()` / `unsqueeze::<D>()`. `squeeze` removes **all** size-1 dims simultaneously — use `reshape([...])` when multiple dims might be size 1 (e.g. batch=1 during inference).
 - **`TensorData`**: No `.value` field. Use `.as_slice::<T>()` to read values.
-- **`Wgpu` backend**: `Wgpu<f32, i32>` — `AutoGraphicsApi` type param was removed.
-- **`#![recursion_limit = "512"]`** in `main.rs` is required due to deep `Sync` trait chains in `wgpu-core 26.x`.
+- **`#![recursion_limit = "512"]`** in `main.rs` is required due to deep `Sync` trait chains in `wgpu-core`.
 - **Dropout**: `Dropout::forward` is a no-op when not in autodiff mode — no explicit eval mode needed for inference.
 - **`GradientClippingConfig`**: at `burn::grad_clipping::GradientClippingConfig`, not `burn::optim`
-- **Weight tying**: `Embedding` exposes `weight: Param<Tensor<B, 2>>` as a public field; call `.val()` to get the tensor — this is Burn's standard pattern and participates in autograd correctly
-- **Backend feature flags**: `--features cuda` selects CUDA backend; default is `wgpu` (Metal on macOS)
-- **`PerplexityMetric`**: Burn internally converts metric outputs to `NdArray` backend — omit the type parameter on `PerplexityMetric::new()` in `.metric_train_numeric()`/`.metric_valid_numeric()` and let inference resolve it. For `MetricCheckpointingStrategy::new()`, use `PerplexityMetric::<B>::new()` since there's no context to infer from.
+- **Weight tying**: `Embedding` exposes `weight: Param<Tensor<2>>` as a public field; call `.val()` to get the tensor — this is Burn's standard pattern and participates in autograd correctly
+- **Backend & TUI feature flags**: `--no-default-features --features cuda` selects CUDA without `wgpu` or `tui`; default is `wgpu,tui` (Metal on macOS); `--no-tui` forces `CliMetricsRenderer` at runtime.
+- **`PerplexityMetric`**: `PerplexityMetric::new()` works without backend type parameters (`MetricCheckpointingStrategy::new(&PerplexityMetric::new(), ...)`).
 
 ## Attention & inference
 

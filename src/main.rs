@@ -47,9 +47,9 @@ enum Commands {
         /// Override preset: context window size
         #[arg(long)]
         block_size: Option<usize>,
-        /// Dropout probability
-        #[arg(long, default_value_t = 0.2)]
-        dropout: f64,
+        /// Override preset: dropout probability
+        #[arg(long)]
+        dropout: Option<f64>,
         /// Training batch size
         #[arg(long, default_value_t = 32)]
         batch_size: usize,
@@ -100,6 +100,9 @@ enum Commands {
         /// Top-p (nucleus) sampling: keep smallest set with cumulative prob >= p (1.0 = disabled)
         #[arg(long, default_value_t = 1.0)]
         top_p: f64,
+        /// Repetition penalty (> 1.0 penalizes repeated tokens; 1.0 = disabled)
+        #[arg(long, default_value_t = 1.0)]
+        repetition_penalty: f64,
     },
 }
 
@@ -117,11 +120,11 @@ fn select_device(cpu: bool) -> Device {
     }
     #[cfg(not(any(feature = "wgpu", feature = "cuda")))]
     {
-        return Device::flex();
+        Device::flex()
     }
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cpu = cli.cpu;
     let device = select_device(cpu);
@@ -156,10 +159,10 @@ fn main() {
                 vocab_size: preset_cfg.vocab_size,
                 n_layer: n_layer.unwrap_or(preset_cfg.n_layer),
                 n_head: n_head.unwrap_or(preset_cfg.n_head),
-                n_kv_head,
+                n_kv_head: n_kv_head.or(preset_cfg.n_kv_head),
                 n_embd: n_embd.unwrap_or(preset_cfg.n_embd),
                 block_size: block_size.unwrap_or(preset_cfg.block_size),
-                dropout,
+                dropout: dropout.unwrap_or(preset_cfg.dropout),
                 rope_theta,
             };
 
@@ -194,7 +197,7 @@ fn main() {
                 );
             }
 
-            run_training(device, dataset_enum, gpt_config, training_config);
+            run_training(device, dataset_enum, gpt_config, training_config)?;
         }
         Commands::Generate {
             artifact_dir,
@@ -203,15 +206,18 @@ fn main() {
             temperature,
             top_k,
             top_p,
+            repetition_penalty,
         } => {
             let sampling = nanoburngpt::model::SamplingParams {
                 temperature,
                 top_k,
                 top_p,
-                repetition_penalty: 1.0,
+                repetition_penalty,
             };
             println!("Generating text on device: {:?}", device);
             generate_text(device, &artifact_dir, &prompt, max_tokens, &sampling);
         }
     }
+
+    Ok(())
 }

@@ -1,6 +1,6 @@
 # Architecture
 
-NanoBurnGPT is a decoder-only Transformer (GPT-2 style) implemented in Rust using the [Burn 0.21](https://burn.dev/) deep learning framework.
+NanoBurnGPT is a decoder-only Transformer (GPT-2 style) implemented in Rust using the [Burn 0.22](https://burn.dev/) deep learning framework.
 
 ---
 
@@ -13,7 +13,7 @@ Text
 BpeTokenizer          tiktoken-rs r50k_base, 50257-token vocab
  │
  ▼
-TextDataset           sliding window sequences of length block_size
+TextDataset           non-overlapping sequences of length block_size
  │
  ▼
 GPT (forward)
@@ -63,7 +63,7 @@ BPE encodes English text at roughly 0.25–0.33 tokens per character (e.g. Shake
 
 ### TextDataset (`data.rs`)
 
-After tokenization, the token sequence is split 90/10 into train and validation sets. A `TextDataset` wraps a flat `Vec<usize>` of token IDs and serves sliding-window samples:
+After tokenization, the token sequence is split 90/10 into train and validation sets. A `TextDataset` wraps a flat `Vec<usize>` of token IDs and serves non-overlapping chunks of length `block_size`:
 
 ```
 tokens:  [t0, t1, t2, t3, t4, t5, ...]
@@ -93,8 +93,6 @@ pub struct GPTConfig {
     pub block_size: usize,        // context window (max sequence length)
     pub dropout:    f64,
     pub rope_theta: f64,          // RoPE frequency base (default 10000.0)
-    pub softcap:    Option<f64>,  // logit softcap (Gemma-2 style)
-    pub share_kv:   bool,         // Q-K=V projection sharing (ICML 2026)
 }
 ```
 
@@ -159,7 +157,8 @@ x → Linear(n_embd → 4*n_embd) → ReLU → square → Linear(4*n_embd → n_
 ### Weight Initialization
 
 Following nanoGPT:
-- All linear weights: `Normal(mean=0, std=0.02)`
+- Token embeddings (`token_embedding`): `Normal(mean=0, std=0.02)`
+- Linear weights: `Normal(mean=0, std=0.02)`
 - Residual projections (`c_proj` in attention and MLP): `Normal(mean=0, std=0.02 / sqrt(2 * n_layer))`
 
 The scaled-down residual init prevents the residual stream from growing too large in deep networks. The `1/sqrt(2*n_layer)` factor accounts for the two residual additions per block (attention + MLP).
@@ -211,12 +210,13 @@ SupervisedTraining::new("artifacts", train_dl, val_dl)
     .metric_valid_numeric(AccuracyMetric)
     .metric_train_numeric(PerplexityMetric)
     .metric_valid_numeric(PerplexityMetric)
-    .with_file_checkpointer(CompactRecorder)
+    .with_default_checkpointers()
     .with_checkpointing_strategy(best_perplexity)
+    .with_application_logger(None)
     .launch(learner)
 ```
 
-Checkpoints are saved per epoch to `artifacts/checkpoint/`. The best checkpoint is selected by lowest validation perplexity (`MetricCheckpointingStrategy`). The final model is saved as `artifacts/model_final.mpk` (MessagePack via `CompactRecorder`).
+Checkpoints are saved per epoch to `artifacts/checkpoint/`. The best checkpoint is selected by lowest validation perplexity (`MetricCheckpointingStrategy`). The final model is saved as `artifacts/model_final.bpk` (Burnpack).
 
 ---
 
@@ -263,10 +263,10 @@ Selected at compile time via Cargo feature flags:
 | Flag | Backend | Target |
 |------|---------|--------|
 | `--features wgpu` (default) | Burn wgpu | Metal on macOS, Vulkan/DX12 elsewhere |
-| `--features cuda` | Burn CUDA (via cubecl) | NVIDIA GPUs |
+| `--no-default-features --features cuda` | Burn CUDA (via cubecl) | NVIDIA GPUs (skips `wgpu` & `tui`) |
 | `--cpu` flag | Burn Flex (CPU) | Fallback when no GPU |
 
-A `compile_error!` fires if neither feature is enabled. CUDA takes precedence if both are specified. The `--amp` flag enables f16 mixed precision on supported backends.
+CUDA takes precedence if both `wgpu` and `cuda` are enabled. `--amp` is currently accepted for CLI compatibility as a no-op on Burn 0.22 (training runs in `f32`).
 
 ```sh
 # Default (wgpu/Metal on macOS)
@@ -304,12 +304,11 @@ Written to `artifacts/` (gitignored):
 | File | Contents |
 |------|----------|
 | `config.json` | `GPTConfig` serialized by Burn |
-| `model_final.mpk` | Final model weights (MessagePack, `CompactRecorder`) |
+| `model_final.bpk` | Final model weights (Burnpack) |
 | `checkpoint/` | Per-epoch weight checkpoints |
-| `train/`, `valid/` | Metric CSVs (loss, accuracy per step) |
-| `experiment.log` | Burn training log |
+| `train/`, `valid/` | Metric CSVs (loss, accuracy, perplexity) |
 
-Inference loads `config.json` to reconstruct the architecture, then loads weights from `model_final.mpk`. The tokenizer needs no artifact — `BpeTokenizer::new()` loads GPT-2's vocabulary from the `tiktoken-rs` crate at runtime.
+Inference loads `config.json` to reconstruct the architecture, then loads weights from `model_final.bpk`. The tokenizer needs no artifact — `BpeTokenizer::new()` loads GPT-2's vocabulary from the `tiktoken-rs` crate at runtime.
 
 ---
 
@@ -317,7 +316,7 @@ Inference loads `config.json` to reconstruct the architecture, then loads weight
 
 | nanoGPT (Python/PyTorch) | NanoBurnGPT (Rust/Burn) |
 |--------------------------|------------------------|
-| Python + PyTorch | Rust + Burn 0.21 |
+| Python + PyTorch | Rust + Burn 0.22 |
 | Flash Attention (PyTorch SDPA) | Burn's fused SDPA kernel (`burn::tensor::module::attention`) |
 | KV cache for inference | KV cache (`GPT::forward_cached`, `KVCache`) |
 | `torch.compile` | Burn's own graph fusion |

@@ -14,27 +14,26 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust (Edition 2024 requires 1.85+)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+# Install Rust (rust-toolchain.toml pins the exact channel)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Verify versions
-RUN rustc --version && cargo --version
 
 # Workspace setup
 WORKDIR /app
 
-# Step 1: Cache dependencies (The "Cargo Chef" style hack)
-# We copy ONLY Cargo.toml and Cargo.lock first to cache the heavy compile
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs && \
-    mkdir -p src/bin && echo "fn main() {}" > src/lib.rs && \
-    cargo build --release --features cuda && \
+# Step 1: Cache dependencies (including vendored pliron patch & pinned toolchain)
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
+RUN rustup show && \
+    rustc --version && cargo --version && \
+    mkdir src && echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs && \
+    cargo build --release --no-default-features --features cuda && \
     rm -rf src/
 
 # Step 2: Copy actual source and build the real binary
 COPY . .
-RUN touch src/main.rs src/lib.rs && cargo build --release --features cuda
+RUN touch src/main.rs src/lib.rs && cargo build --release --no-default-features --features cuda
 
 # Set execution permissions for the cloud helper script
 RUN chmod +x run_cloud.sh

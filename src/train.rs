@@ -167,18 +167,28 @@ impl InferenceStep for GPT {
 // Training entry point
 // ---------------------------------------------------------------------------
 
+pub(crate) fn compute_total_optimizer_steps(
+    dataset_len: usize,
+    batch_size: usize,
+    grad_accum_steps: usize,
+    num_epochs: usize,
+) -> usize {
+    let batch_size = batch_size.max(1);
+    let grad_accum = grad_accum_steps.max(1);
+    let micro_steps_per_epoch = dataset_len.div_ceil(batch_size);
+    let opt_steps_per_epoch = micro_steps_per_epoch.div_ceil(grad_accum);
+    opt_steps_per_epoch * num_epochs
+}
+
 pub fn run_training(
     device: Device,
     dataset: Dataset,
     mut gpt_config: GPTConfig,
     training_config: TrainingConfig,
-) {
+) -> anyhow::Result<()> {
     // --- Data ---
-    let data_path = dataset
-        .ensure_downloaded()
-        .expect("Dataset download failed");
-    let (train_dataset, val_dataset) =
-        load_text(&data_path, gpt_config.block_size).expect("Failed to load dataset");
+    let data_path = dataset.ensure_downloaded()?;
+    let (train_dataset, val_dataset) = load_text(&data_path, gpt_config.block_size)?;
 
     // Optionally cap the training set for smoke tests
     let train_dataset = if training_config.max_train_items > 0 {
@@ -190,16 +200,22 @@ pub fn run_training(
     gpt_config.vocab_size = BpeTokenizer::VOCAB_SIZE;
     println!("Vocab size: {} (BPE r50k_base)", gpt_config.vocab_size);
 
-    std::fs::create_dir_all("artifacts").ok();
+    std::fs::create_dir_all("artifacts")?;
     gpt_config
         .save("artifacts/config.json")
-        .expect("Config saved");
+        .map_err(|e| anyhow::anyhow!("Failed to save config: {e:?}"))?;
 
-    // Compute total training steps for the LR schedule
-    let steps_per_epoch = train_dataset.len() / training_config.batch_size;
-    let total_iters = steps_per_epoch * training_config.num_epochs;
+    // Compute total optimizer steps for the LR schedule (Burn steps LR once per optimizer update)
+    let micro_steps_per_epoch = train_dataset.len().div_ceil(training_config.batch_size.max(1));
+    let total_iters = compute_total_optimizer_steps(
+        train_dataset.len(),
+        training_config.batch_size,
+        training_config.grad_accum_steps,
+        training_config.num_epochs,
+    );
     println!(
-        "Steps/epoch: {steps_per_epoch}  |  Total steps: {total_iters}  |  Warmup: {}",
+        "Micro-steps/epoch: {micro_steps_per_epoch}  |  Optimizer steps: {total_iters} (accum={})  |  Warmup: {}",
+        training_config.grad_accum_steps.max(1),
         training_config.warmup_iters
     );
 
@@ -255,9 +271,13 @@ pub fn run_training(
         .metric_valid_numeric(PerplexityMetric::new())
         .with_default_checkpointers()
         .with_checkpointing_strategy(strategy)
+        .with_application_logger(None)
         .num_epochs(training_config.num_epochs)
-        .grads_accumulation(training_config.grad_accum_steps)
         .summary();
+
+    if training_config.grad_accum_steps > 1 {
+        training = training.grads_accumulation(training_config.grad_accum_steps);
+    }
 
     if training_config.no_tui || cfg!(not(feature = "tui")) {
         training = training.renderer(Box::new(CliMetricsRenderer::new()));
@@ -266,14 +286,15 @@ pub fn run_training(
     let result = training.launch(learner);
 
     if let Some(err) = &result.error {
-        eprintln!("Training failed: {err:?}");
+        anyhow::bail!("Training failed: {err:?}");
     }
 
     result
         .model
         .save_file("artifacts/model_final")
-        .expect("Failed to save final model");
+        .map_err(|e| anyhow::anyhow!("Failed to save final model: {e:?}"))?;
     println!("Model saved to artifacts/model_final");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +307,6 @@ mod tests {
     use crate::data::TextDataset;
     use burn::data::dataset::Dataset as BurnDataset;
     use burn::data::dataloader::batcher::Batcher;
-    use burn::optim::Optimizer;
 
     fn scheduler(max_lr: f64, min_lr: f64, warmup: usize, total: usize) -> WarmupCosineScheduler {
         WarmupCosineScheduler::new(max_lr, min_lr, warmup, total)
@@ -422,5 +442,16 @@ mod tests {
             initial_loss,
             final_loss
         );
+    }
+
+    #[test]
+    fn optimizer_steps_account_for_grad_accum_and_partial_batches() {
+        assert_eq!(compute_total_optimizer_steps(100, 10, 1, 3), 30);
+        // 100 items / batch 10 = 10 micro-steps; accum 4 -> ceil(10/4) = 3 opt steps/epoch
+        assert_eq!(compute_total_optimizer_steps(100, 10, 4, 2), 6);
+        // Partial final batch: 101 items / batch 10 = 11 micro-steps
+        assert_eq!(compute_total_optimizer_steps(101, 10, 1, 1), 11);
+        // Zero grad_accum_steps safely treated as 1
+        assert_eq!(compute_total_optimizer_steps(10, 5, 0, 2), 4);
     }
 }

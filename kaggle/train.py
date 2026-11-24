@@ -17,10 +17,10 @@ MODEL = "gpt2-small"
 DATASET = "shakespeare"
 OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
 DTYPE = "flex32"  # flex32 unlocks FP16 Tensor Cores on T4 with FP32 storage
-MULTI_GPU = "auto"  # auto uses OptimSharded across both Kaggle T4 GPUs
+MULTI_GPU = "auto"  # auto uses 1x T4 for flex32 (NCCL rejects flex32) or 2x for f32/bf16
 GRAD_CHECKPOINTING = False
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 2  # x2 GPUs x batch 8 = effective batch 32 sequences
+GRAD_ACCUM_STEPS = 4  # 1x T4 x batch 8 x accum 4 = effective batch 32 sequences (matches v2 baseline)
 BLOCK_SIZE = 256  # 0 = use preset default
 NUM_EPOCHS = 10
 LEARNING_RATE = 3e-4

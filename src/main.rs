@@ -243,13 +243,21 @@ fn main() -> anyhow::Result<()> {
             };
 
             let mut devices = select_training_devices(cpu, multi_gpu_mode);
-            if devices.len() > 1
-                && multi_gpu_mode == MultiGpuMode::Ddp
-                && float_dtype == FloatDType::Flex32
-            {
-                anyhow::bail!(
-                    "NCCL DDP does not support flex32; use --multi-gpu sharded (or --multi-gpu auto) with flex32, or --dtype bf16/f32 with ddp."
-                );
+            if devices.len() > 1 && float_dtype == FloatDType::Flex32 {
+                match multi_gpu_mode {
+                    MultiGpuMode::Auto => {
+                        println!(
+                            "Note: Burn 0.22.1 CUDA multi-GPU collectives (NCCL) do not support flex32; using 1 GPU with flex32 Tensor Cores."
+                        );
+                        devices.truncate(1);
+                    }
+                    MultiGpuMode::Sharded | MultiGpuMode::Ddp => {
+                        anyhow::bail!(
+                            "Burn 0.22.1 CUDA multi-GPU collectives (NCCL) do not support flex32; use --multi-gpu off (or auto) with flex32, or --dtype f32/bf16 with multi-GPU."
+                        );
+                    }
+                    MultiGpuMode::Off => {}
+                }
             }
 
             if float_dtype == FloatDType::F16 {

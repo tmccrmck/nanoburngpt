@@ -18,6 +18,10 @@ RUN apt-get update && apt-get install -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Skip host LTO (GPU kernels are JIT-compiled) for faster container builds
+ENV CARGO_PROFILE_RELEASE_LTO=off
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+
 # Workspace setup
 WORKDIR /app
 

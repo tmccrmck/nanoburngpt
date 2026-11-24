@@ -13,24 +13,27 @@ from pathlib import Path
 REPO_URL = "https://github.com/tmccrmck/nanoburngpt.git"
 BRANCH = "main"
 
-MODEL = "nano"
+MODEL = "gpt2-small"
 DATASET = "shakespeare"
-BATCH_SIZE = 32
-GRAD_ACCUM_STEPS = 1
-BLOCK_SIZE = 0  # 0 = use preset default
-NUM_EPOCHS = 1
-LEARNING_RATE = 1e-3
-WARMUP_ITERS = 20
+BATCH_SIZE = 8
+GRAD_ACCUM_STEPS = 4
+BLOCK_SIZE = 256  # 0 = use preset default
+NUM_EPOCHS = 10
+LEARNING_RATE = 3e-4
+WARMUP_ITERS = 30
 NUM_WORKERS = 2
 # 0 = full dataset (e.g. set MAX_TRAIN_ITEMS = 4000, MODEL = "nano",
 # NUM_EPOCHS = 1 for a quick end-to-end smoke test).
-MAX_TRAIN_ITEMS = 4000
+MAX_TRAIN_ITEMS = 0
 
 GENERATE_PROMPT = "HAMLET:\n"
-GENERATE_TOKENS = 100
+GENERATE_TOKENS = 200
+REPETITION_PENALTY = 1.1
 
 REPO_DIR = Path("/tmp/nanoburngpt")
-OUTPUT_ARTIFACTS = Path("/kaggle/working/artifacts")
+OUTPUT_DIR = Path("/kaggle/working")
+OUTPUT_ARTIFACTS = OUTPUT_DIR / "artifacts"
+CACHED_INPUT_DIR = Path("/kaggle/input/nanoburngpt-cuda-train")
 
 
 def banner(msg: str) -> None:
@@ -60,47 +63,63 @@ def main() -> None:
     run(["df", "-h", "/tmp", "/kaggle/working"], check=False)
     run(["free", "-h"], check=False)
 
-    # 2. Install Rust toolchain if needed
-    banner("Rust Toolchain")
-    cargo_bin = str(Path.home() / ".cargo" / "bin")
-    if cargo_bin not in os.environ.get("PATH", "").split(os.pathsep):
-        os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
-
-    if not shutil.which("cargo"):
-        print("Installing Rust via rustup...", flush=True)
-        run([
-            "sh",
-            "-c",
-            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
-        ])
-
-    # 3. Clone into /tmp so Rust's target/ stays out of /kaggle/working
+    # 2. Clone into /tmp so Rust's target/ stays out of /kaggle/working
     banner(f"Clone {REPO_URL} ({BRANCH})")
     if REPO_DIR.exists():
         shutil.rmtree(REPO_DIR)
     run(["git", "clone", "--branch", BRANCH, "--depth", "1", REPO_URL, str(REPO_DIR)])
 
-    # 4. Enter repo and confirm active toolchain (triggers rust-toolchain.toml)
     os.chdir(REPO_DIR)
     print(f"Working directory: {Path.cwd()}", flush=True)
     run(["git", "log", "-n", "1", "--oneline"])
-    run(["rustc", "--version"])
-    run(["cargo", "--version"])
+    head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    print(f"HEAD SHA: {head_sha}", flush=True)
 
-    # 5. Build release binary with CUDA only (no wgpu, no TUI)
-    banner("Building NanoBurnGPT (CUDA)")
-    build_env = os.environ.copy()
-    build_env["CARGO_PROFILE_RELEASE_LTO"] = "thin"
-    build_env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] = "16"
+    # 3. Restore cached CUDA binary if SHA matches, otherwise install Rust & build
+    binary_path = REPO_DIR / "target/release/nanoburngpt"
+    cached_bin = CACHED_INPUT_DIR / "nanoburngpt"
+    cached_sha_file = CACHED_INPUT_DIR / "nanoburngpt.sha"
 
-    t0 = time.monotonic()
-    run(
-        ["cargo", "build", "--release", "--no-default-features", "--features", "cuda"],
-        env=build_env,
-    )
-    print(f"Build completed in {time.monotonic() - t0:.1f}s", flush=True)
+    if (
+        cached_bin.exists()
+        and cached_sha_file.exists()
+        and cached_sha_file.read_text().strip() == head_sha
+    ):
+        banner("Using Cached CUDA Binary")
+        binary_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cached_bin, binary_path)
+        binary_path.chmod(0o755)
+        print(f"Restored {cached_bin} ({head_sha[:8]})", flush=True)
+    else:
+        banner("Rust Toolchain")
+        cargo_bin = str(Path.home() / ".cargo" / "bin")
+        if cargo_bin not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
 
-    binary = "./target/release/nanoburngpt"
+        if not shutil.which("cargo"):
+            print("Installing Rust via rustup...", flush=True)
+            run([
+                "sh",
+                "-c",
+                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none",
+            ])
+
+        run(["rustc", "--version"])
+        run(["cargo", "--version"])
+
+        banner("Building NanoBurnGPT (CUDA)")
+        build_env = os.environ.copy()
+        build_env["CARGO_PROFILE_RELEASE_LTO"] = "off"
+        build_env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] = "16"
+
+        t0 = time.monotonic()
+        run(
+            ["cargo", "build", "--release", "--no-default-features", "--features", "cuda"],
+            env=build_env,
+        )
+        print(f"Build completed in {time.monotonic() - t0:.1f}s", flush=True)
+
+    binary = str(binary_path)
 
     # 6. Train on GPU
     banner(f"Training ({MODEL} on {DATASET})")
@@ -126,7 +145,7 @@ def main() -> None:
     run(train_cmd)
     print(f"Training completed in {time.monotonic() - t0:.1f}s", flush=True)
 
-    # 7. Generate sample text from trained checkpoint
+    # 5. Generate sample text from trained checkpoint
     banner("Generating Sample Text")
     run([
         binary,
@@ -137,18 +156,27 @@ def main() -> None:
         "--temperature", "0.8",
         "--top-k", "40",
         "--top-p", "0.95",
+        "--repetition-penalty", str(REPETITION_PENALTY),
     ])
 
-    # 8. Export artifacts to /kaggle/working/artifacts
-    banner("Exporting Artifacts")
+    # 6. Export artifacts and CUDA binary to /kaggle/working
+    banner("Exporting Artifacts & Binary")
     src_artifacts = REPO_DIR / "artifacts"
     if not src_artifacts.exists():
         raise FileNotFoundError(f"Expected artifacts directory at {src_artifacts}")
     shutil.copytree(src_artifacts, OUTPUT_ARTIFACTS, dirs_exist_ok=True)
+    exported_bin = OUTPUT_DIR / "nanoburngpt"
+    shutil.copy2(binary_path, exported_bin)
+    exported_bin.chmod(0o755)
+    (OUTPUT_DIR / "nanoburngpt.sha").write_text(head_sha + "\n")
     for path in sorted(OUTPUT_ARTIFACTS.rglob("*")):
         if path.is_file():
             size_mb = path.stat().st_size / (1024 * 1024)
             print(f"{path} ({size_mb:.2f} MB)", flush=True)
+    print(
+        f"{exported_bin} ({exported_bin.stat().st_size / (1024 * 1024):.2f} MB)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

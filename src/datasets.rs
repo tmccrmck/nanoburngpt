@@ -70,7 +70,12 @@ impl Dataset {
 
 fn download_shakespeare(dest: &std::path::Path) -> anyhow::Result<()> {
     println!("Downloading Shakespeare from {}...", SHAKESPEARE_URL);
-    let text = reqwest::blocking::get(SHAKESPEARE_URL)?.text()?;
+    let text = ureq::get(SHAKESPEARE_URL)
+        .call()?
+        .body_mut()
+        .with_config()
+        .limit(16 * 1024 * 1024)
+        .read_to_string()?;
     fs::write(dest, text)?;
     println!("Saved to {}", dest.display());
     Ok(())
@@ -78,7 +83,12 @@ fn download_shakespeare(dest: &std::path::Path) -> anyhow::Result<()> {
 
 fn download_wikitext103(dest: &std::path::Path) -> anyhow::Result<()> {
     println!("Downloading WikiText-103 from {}...", WIKITEXT103_URL);
-    let bytes = reqwest::blocking::get(WIKITEXT103_URL)?.bytes()?;
+    let bytes = ureq::get(WIKITEXT103_URL)
+        .call()?
+        .body_mut()
+        .with_config()
+        .limit(512 * 1024 * 1024)
+        .read_to_vec()?;
     println!("Extracting zip ({} MB)...", bytes.len() / 1_000_000);
 
     let cursor = Cursor::new(bytes);

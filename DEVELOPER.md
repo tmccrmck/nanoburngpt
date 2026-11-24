@@ -18,7 +18,7 @@ Based on [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 | Dataset     | Shakespeare / WikiText-103 (BPE tokenized)  |
 | CLI         | `clap`                                      |
 | Tokenizer   | `tiktoken-rs` (GPT-2 BPE r50k_base)         |
-| HTTP        | `reqwest` (dataset download)                |
+| HTTP        | `ureq` (dataset download)                   |
 
 ## Project Structure
 

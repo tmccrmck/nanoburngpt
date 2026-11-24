@@ -43,6 +43,10 @@ Options:
   --num-epochs <N>        Training epochs               [default: 10]
   --warmup-iters <N>      Linear warmup steps           [default: 100]
   --max-train-items <N>   Cap dataset size (0=full)     [default: 0]
+  --max-val-items <N>     Cap validation size (0=full)  [default: 0]
+  --artifact-dir <PATH>   Output directory              [default: artifacts]
+  --resume <EPOCH>        Resume from saved checkpoint epoch
+  --optimizer <NAME>      Optimizer: adamw, muon        [default: adamw]
   --grad-accum-steps <N>  Gradient accumulation steps   [default: 1]
   --grad-checkpointing    Enable activation checkpointing to save VRAM
   --rope-theta <F>        RoPE frequency base           [default: 10000.0]
@@ -52,7 +56,7 @@ Options:
   --no-tui                Disable interactive TUI; print plain CLI logs
 ```
 
-Saves `artifacts/model_final.bpk` and `artifacts/config.json` on completion.
+Saves `artifacts/model_final.bpk`, `artifacts/model_best.bpk` (best validation perplexity), and `artifacts/config.json` on completion.
 
 ### `generate`
 
@@ -69,6 +73,7 @@ Options:
   --top-p <F>                Nucleus sampling (1.0 = all)     [default: 1.0]
   --repetition-penalty <F>   Repetition penalty (1.0 = off)   [default: 1.0]
   --dtype <DTYPE>            Precision: f32, flex32, bf16, f16 [default: f32]
+  --best                     Load model_best.bpk instead of model_final.bpk
 ```
 
 ## Model Presets

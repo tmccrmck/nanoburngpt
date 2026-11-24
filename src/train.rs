@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -10,10 +11,11 @@ use burn::{
     config::Config,
     data::dataloader::DataLoaderBuilder,
     grad_clipping::GradientClippingConfig,
-    module::Module,
+    module::{Module, ParamGroup},
     nn::loss::CrossEntropyLossConfig,
     optim::{
-        AdamWConfig,
+        AdamWConfig, AdjustLrFn, ModuleOptimizer, MuonConfig,
+        decay::WeightDecayConfig,
         lr_scheduler::{LrScheduler, LrSchedulerRecord},
     },
     prelude::*,
@@ -24,7 +26,9 @@ use burn::{
     train::{
         ExecutionStrategy, InferenceStep, Learner, MultiDeviceOptim, SupervisedTraining,
         TrainOutput, TrainStep, TrainingStrategy,
-        checkpoint::MetricCheckpointingStrategy,
+        checkpoint::{
+            ComposedCheckpointingStrategy, KeepLastNCheckpoints, MetricCheckpointingStrategy,
+        },
         metric::{
             Adaptor, ItemLazy, LossInput, LossMetric, Metric, MetricAttributes, MetricMetadata,
             MetricName, Numeric, NumericAttributes, NumericEntry, SerializedEntry,
@@ -35,8 +39,26 @@ use burn::{
 };
 
 // ---------------------------------------------------------------------------
-// Multi-GPU strategy selection
+// Multi-GPU & Optimizer selection
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptimizerChoice {
+    AdamW,
+    Muon,
+}
+
+impl FromStr for OptimizerChoice {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "adamw" => Ok(Self::AdamW),
+            "muon" => Ok(Self::Muon),
+            other => anyhow::bail!("Unknown --optimizer '{other}'. Available: adamw, muon"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MultiGpuMode {
@@ -83,6 +105,14 @@ pub struct TrainingConfig {
     /// 0 = full dataset; positive value caps training items (smoke tests).
     #[config(default = 0)]
     pub max_train_items: usize,
+    /// 0 = full validation set; positive value caps validation items.
+    #[config(default = 0)]
+    pub max_val_items: usize,
+    /// Directory where checkpoints, metrics, config.json, and model weights are saved.
+    #[config(default = "String::from(\"artifacts\")")]
+    pub artifact_dir: String,
+    /// Resume training from a saved checkpoint epoch (e.g. Some(5)).
+    pub resume_epoch: Option<usize>,
     /// Enable mixed precision (AMP / Flex32)
     #[config(default = false)]
     pub amp: bool,
@@ -383,9 +413,96 @@ pub(crate) fn compute_total_optimizer_steps(
     opt_steps_per_epoch * num_epochs
 }
 
+pub(crate) fn build_optimizer(choice: OptimizerChoice) -> ModuleOptimizer {
+    let grad_clip = GradientClippingConfig::Norm(1.0);
+    let norm_group = ParamGroup::from_any_predicates(vec!["ln_1", "ln_2", "ln_f"]);
+    let norm_adamw = AdamWConfig::new()
+        .with_beta_1(0.9)
+        .with_beta_2(0.95)
+        .with_weight_decay(0.0)
+        .with_epsilon(1e-8)
+        .build();
+
+    let base_optim = AdamWConfig::new()
+        .with_beta_1(0.9)
+        .with_beta_2(0.95)
+        .with_weight_decay(0.1)
+        .with_epsilon(1e-8)
+        .with_grad_clipping(Some(grad_clip.clone()))
+        .init()
+        .with_group(norm_group, norm_adamw, Some(grad_clip.init()));
+
+    match choice {
+        OptimizerChoice::AdamW => base_optim,
+        OptimizerChoice::Muon => {
+            let hidden_2d_group = ParamGroup::from_any_predicates(vec!["c_attn", "c_proj", "c_fc"]);
+            let muon = MuonConfig::new()
+                .with_adjust_lr_fn(AdjustLrFn::MatchRmsAdamW)
+                .with_weight_decay(Some(WeightDecayConfig::new(0.1)))
+                .build();
+            base_optim.with_group(hidden_2d_group, muon, Some(grad_clip.init()))
+        }
+    }
+}
+
+/// Find the epoch with the lowest final validation perplexity whose checkpoint
+/// file exists under `<artifact_dir>/checkpoint/model-<epoch>.bpk` and copy it
+/// to `<artifact_dir>/model_best.bpk`.
+pub(crate) fn export_best_checkpoint(artifact_dir: &Path) -> anyhow::Result<Option<(usize, f64)>> {
+    let valid_dir = artifact_dir.join("valid");
+    if !valid_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut best: Option<(usize, f64)> = None;
+    for entry in std::fs::read_dir(&valid_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(epoch_str) = name.to_str().and_then(|s| s.strip_prefix("epoch-")) else {
+            continue;
+        };
+        let Ok(epoch) = epoch_str.parse::<usize>() else {
+            continue;
+        };
+        let ckpt_path = artifact_dir
+            .join("checkpoint")
+            .join(format!("model-{epoch}.bpk"));
+        if !ckpt_path.exists() {
+            continue;
+        }
+        let ppl_log = entry.path().join("Perplexity.log");
+        if !ppl_log.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&ppl_log)?;
+        let final_ppl = text.lines().rev().find_map(|line| {
+            let (val, tag) = line.trim().split_once(',')?;
+            (tag == "final").then(|| val.parse::<f64>().ok()).flatten()
+        });
+        if let Some(ppl) = final_ppl
+            && ppl.is_finite()
+            && best.is_none_or(|(_, best_ppl)| ppl < best_ppl)
+        {
+            best = Some((epoch, ppl));
+        }
+    }
+
+    if let Some((epoch, ppl)) = best {
+        let src = artifact_dir
+            .join("checkpoint")
+            .join(format!("model-{epoch}.bpk"));
+        let dst = artifact_dir.join("model_best.bpk");
+        std::fs::copy(&src, &dst)?;
+        return Ok(Some((epoch, ppl)));
+    }
+
+    Ok(None)
+}
+
 pub fn run_training(
     devices: Vec<Device>,
     multi_gpu: MultiGpuMode,
+    optimizer_choice: OptimizerChoice,
     dataset: Dataset,
     mut gpt_config: GPTConfig,
     training_config: TrainingConfig,
@@ -408,19 +525,25 @@ pub fn run_training(
     let data_path = dataset.ensure_downloaded()?;
     let (train_dataset, val_dataset) = load_text(&data_path, gpt_config.block_size)?;
 
-    // Optionally cap the training set for smoke tests
+    // Optionally cap train/validation sets
     let train_dataset = if training_config.max_train_items > 0 {
         train_dataset.with_max_len(training_config.max_train_items)
     } else {
         train_dataset
     };
+    let val_dataset = if training_config.max_val_items > 0 {
+        val_dataset.with_max_len(training_config.max_val_items)
+    } else {
+        val_dataset
+    };
 
     gpt_config.vocab_size = BpeTokenizer::VOCAB_SIZE;
     println!("Vocab size: {} (BPE r50k_base)", gpt_config.vocab_size);
 
-    std::fs::create_dir_all("artifacts")?;
+    let artifact_dir = Path::new(&training_config.artifact_dir);
+    std::fs::create_dir_all(artifact_dir)?;
     gpt_config
-        .save("artifacts/config.json")
+        .save(artifact_dir.join("config.json"))
         .map_err(|e| anyhow::anyhow!("Failed to save config: {e:?}"))?;
 
     // Compute total optimizer steps for the LR schedule (Burn steps LR once per optimizer update)
@@ -434,7 +557,7 @@ pub fn run_training(
         training_config.num_epochs,
     );
     println!(
-        "Devices: {num_devices}  |  Micro-steps/epoch/dev: {micro_steps_per_epoch}  |  Optimizer steps: {total_iters} (accum={grad_accum}, loss_scale={loss_scale:.4})  |  Warmup: {}",
+        "Devices: {num_devices}  |  Optimizer: {optimizer_choice:?}  |  Micro-steps/epoch/dev: {micro_steps_per_epoch}  |  Optimizer steps: {total_iters} (accum={grad_accum}, loss_scale={loss_scale:.4})  |  Warmup: {}",
         training_config.warmup_iters
     );
 
@@ -453,14 +576,8 @@ pub fn run_training(
         .num_workers(training_config.num_workers)
         .build(val_dataset);
 
-    // --- Optimizer (nanoGPT hyperparameters) ---
-    let optim = AdamWConfig::new()
-        .with_beta_1(0.9)
-        .with_beta_2(0.95)
-        .with_weight_decay(0.1)
-        .with_epsilon(1e-8)
-        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
-        .init();
+    // --- Optimizer (0.0 WD on 1D norms; optional hybrid Muon for 2D block weights) ---
+    let optim = build_optimizer(optimizer_choice);
 
     // --- LR scheduler: linear warmup → cosine decay ---
     let min_lr = training_config.learning_rate / 10.0;
@@ -479,12 +596,15 @@ pub fn run_training(
     let model = GPT::new(&gpt_config, &main_device);
     let learner = Learner::new(model, optim, lr_scheduler);
 
-    let strategy = MetricCheckpointingStrategy::new(
-        &LossPerplexityMetric::new(),
-        Aggregate::Mean,
-        Direction::Lowest,
-        Split::Valid,
-    );
+    let strategy = ComposedCheckpointingStrategy::builder()
+        .add(MetricCheckpointingStrategy::new(
+            &LossPerplexityMetric::new(),
+            Aggregate::Mean,
+            Direction::Lowest,
+            Split::Valid,
+        ))
+        .add(KeepLastNCheckpoints::new(1))
+        .build();
 
     let exec_strategy = if !use_multi {
         ExecutionStrategy::single(devices[0].clone())
@@ -503,7 +623,7 @@ pub fn run_training(
         }
     };
 
-    let mut training = SupervisedTraining::new("artifacts", dataloader_train, dataloader_val)
+    let mut training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_val)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
         .metric_train_numeric(LossPerplexityMetric::new())
@@ -514,6 +634,11 @@ pub fn run_training(
         .with_training_strategy(TrainingStrategy::Default(exec_strategy))
         .num_epochs(training_config.num_epochs)
         .summary();
+
+    if let Some(epoch) = training_config.resume_epoch {
+        println!("Resuming from checkpoint epoch {epoch} in {}", artifact_dir.display());
+        training = training.checkpoint(epoch);
+    }
 
     if training_config.grad_checkpointing {
         training = training.gradient_checkpointing();
@@ -533,11 +658,20 @@ pub fn run_training(
         anyhow::bail!("Training failed: {err:?}");
     }
 
+    let final_path = artifact_dir.join("model_final");
     result
         .model
-        .save_file("artifacts/model_final")
+        .save_file(&final_path)
         .map_err(|e| anyhow::anyhow!("Failed to save final model: {e:?}"))?;
-    println!("Model saved to artifacts/model_final");
+    println!("Final model saved to {}", final_path.display());
+
+    if let Some((best_epoch, best_ppl)) = export_best_checkpoint(artifact_dir)? {
+        println!(
+            "Best validation model (epoch {best_epoch}, valid ppl {best_ppl:.2}) exported to {}",
+            artifact_dir.join("model_best.bpk").display()
+        );
+    }
+
     Ok(())
 }
 
@@ -730,5 +864,69 @@ mod tests {
             }
             other => panic!("unexpected final_value: {other:?}"),
         }
+    }
+
+    #[test]
+    fn muon_and_adamw_param_groups_converge() {
+        for choice in [OptimizerChoice::AdamW, OptimizerChoice::Muon] {
+            let device = Device::flex().autodiff();
+            let block_size = 4;
+            let data: Vec<usize> = vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
+            let dataset = TextDataset::new(data, block_size);
+            let config = GPTConfig {
+                vocab_size: 3,
+                n_layer: 1,
+                n_head: 1,
+                n_embd: 8,
+                n_kv_head: None,
+                block_size,
+                dropout: 0.0,
+                rope_theta: 10000.0,
+            };
+            let mut model = GPT::new(&config, &device);
+            let mut optim = build_optimizer(choice);
+            let batcher = TextGenerationBatcher::new(block_size);
+            let item = BurnDataset::get(&dataset, 0).unwrap();
+
+            let initial_loss: f32 = model
+                .forward_loss(batcher.batch(vec![item.clone()], &device))
+                .loss
+                .into_scalar();
+            for _ in 0..8 {
+                let batch = batcher.batch(vec![item.clone()], &device);
+                let out = TrainStep::step(&model, batch);
+                model = optim.step(0.01, model, out.grads);
+            }
+            let final_loss: f32 = model
+                .forward_loss(batcher.batch(vec![item], &device))
+                .loss
+                .into_scalar();
+            assert!(
+                final_loss < initial_loss,
+                "{choice:?} did not decrease loss: {initial_loss} -> {final_loss}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_best_checkpoint_selects_lowest_valid_ppl() {
+        let dir = std::env::temp_dir().join("nanoburngpt_test_best_ckpt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("checkpoint")).unwrap();
+        std::fs::create_dir_all(dir.join("valid/epoch-1")).unwrap();
+        std::fs::create_dir_all(dir.join("valid/epoch-2")).unwrap();
+        std::fs::create_dir_all(dir.join("valid/epoch-3")).unwrap();
+
+        std::fs::write(dir.join("checkpoint/model-1.bpk"), b"ep1").unwrap();
+        std::fs::write(dir.join("checkpoint/model-2.bpk"), b"ep2").unwrap();
+        std::fs::write(dir.join("checkpoint/model-3.bpk"), b"ep3").unwrap();
+        std::fs::write(dir.join("valid/epoch-1/Perplexity.log"), "200.0,final\n").unwrap();
+        std::fs::write(dir.join("valid/epoch-2/Perplexity.log"), "95.5,final\n").unwrap();
+        std::fs::write(dir.join("valid/epoch-3/Perplexity.log"), "140.2,final\n").unwrap();
+
+        let best = export_best_checkpoint(&dir).unwrap();
+        assert_eq!(best, Some((2, 95.5)));
+        assert_eq!(std::fs::read(dir.join("model_best.bpk")).unwrap(), b"ep2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -15,6 +15,7 @@ BRANCH = "main"
 
 MODEL = "gpt2-small"
 DATASET = "shakespeare"
+OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
 DTYPE = "flex32"  # flex32 unlocks FP16 Tensor Cores on T4 with FP32 storage
 MULTI_GPU = "auto"  # auto uses OptimSharded across both Kaggle T4 GPUs
 GRAD_CHECKPOINTING = False
@@ -33,6 +34,7 @@ GENERATE_PROMPT = "HAMLET:\n"
 GENERATE_TOKENS = 200
 REPETITION_PENALTY = 1.1
 GENERATE_DTYPE = "f16"
+USE_BEST_CHECKPOINT = True
 
 REPO_DIR = Path("/tmp/nanoburngpt")
 OUTPUT_DIR = Path("/kaggle/working")
@@ -126,12 +128,13 @@ def main() -> None:
     binary = str(binary_path)
 
     # 4. Train on GPU
-    banner(f"Training ({MODEL} on {DATASET}, dtype={DTYPE}, multi_gpu={MULTI_GPU})")
+    banner(f"Training ({MODEL} on {DATASET}, opt={OPTIMIZER}, dtype={DTYPE}, multi_gpu={MULTI_GPU})")
     train_cmd = [
         binary,
         "train",
         "--model", MODEL,
         "--dataset", DATASET,
+        "--optimizer", OPTIMIZER,
         "--dtype", DTYPE,
         "--multi-gpu", MULTI_GPU,
         "--batch-size", str(BATCH_SIZE),
@@ -155,7 +158,7 @@ def main() -> None:
 
     # 5. Generate sample text from trained checkpoint
     banner("Generating Sample Text")
-    run([
+    gen_cmd = [
         binary,
         "generate",
         "--artifact-dir", "artifacts",
@@ -166,7 +169,10 @@ def main() -> None:
         "--top-p", "0.95",
         "--repetition-penalty", str(REPETITION_PENALTY),
         "--dtype", GENERATE_DTYPE,
-    ])
+    ]
+    if USE_BEST_CHECKPOINT:
+        gen_cmd.append("--best")
+    run(gen_cmd)
 
     # 6. Export artifacts and CUDA binary to /kaggle/working
     banner("Exporting Artifacts & Binary")

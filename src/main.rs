@@ -3,13 +3,13 @@
 use std::str::FromStr;
 
 use burn::{prelude::*, tensor::FloatDType};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use nanoburngpt::{
     datasets::Dataset,
     inference::generate_text,
     model::GPTConfig,
     presets::ModelPreset,
-    train::{MultiGpuMode, TrainingConfig, run_training},
+    train::{MultiGpuMode, OptimizerChoice, TrainingConfig, run_training},
 };
 
 #[derive(Parser)]
@@ -23,76 +23,91 @@ struct Cli {
     cpu: bool,
 }
 
+#[derive(Args)]
+struct TrainArgs {
+    /// Model size preset (nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl)
+    #[arg(long, default_value = "nano")]
+    model: String,
+    /// Dataset to train on (shakespeare, wikitext103)
+    #[arg(long, default_value = "shakespeare")]
+    dataset: String,
+    /// Override preset: number of transformer layers
+    #[arg(long)]
+    n_layer: Option<usize>,
+    /// Override preset: number of attention heads
+    #[arg(long)]
+    n_head: Option<usize>,
+    /// Override preset: number of key/value heads for GQA (Grouped-Query Attention)
+    #[arg(long)]
+    n_kv_head: Option<usize>,
+    /// Override preset: embedding dimension
+    #[arg(long)]
+    n_embd: Option<usize>,
+    /// Override preset: context window size
+    #[arg(long)]
+    block_size: Option<usize>,
+    /// Override preset: dropout probability
+    #[arg(long)]
+    dropout: Option<f64>,
+    /// Training batch size
+    #[arg(long, default_value_t = 32)]
+    batch_size: usize,
+    /// Number of dataloader workers
+    #[arg(long, default_value_t = 4)]
+    num_workers: usize,
+    /// Learning rate
+    #[arg(long, default_value_t = 1e-3)]
+    learning_rate: f64,
+    /// Number of training epochs
+    #[arg(long, default_value_t = 10)]
+    num_epochs: usize,
+    /// Warmup steps before cosine decay (0 = no warmup)
+    #[arg(long, default_value_t = 100)]
+    warmup_iters: usize,
+    /// Cap training items (0 = use full dataset; useful for smoke tests)
+    #[arg(long, default_value_t = 0)]
+    max_train_items: usize,
+    /// Cap validation items (0 = use full validation set)
+    #[arg(long, default_value_t = 0)]
+    max_val_items: usize,
+    /// Directory where checkpoints, metrics, and final weights are saved
+    #[arg(long, default_value = "artifacts")]
+    artifact_dir: String,
+    /// Resume training from a saved checkpoint epoch
+    #[arg(long)]
+    resume: Option<usize>,
+    /// Optimizer (adamw, muon). muon uses Muon for 2D block weights + AdamW for embeddings/norms.
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
+    /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
+    #[arg(long, default_value_t = 10000.0)]
+    rope_theta: f64,
+    /// Floating-point precision (f32, flex32, bf16, f16).
+    /// flex32 uses FP16 Tensor Cores with FP32 storage/accumulation (recommended on T4/wgpu);
+    /// bf16 halves VRAM on Ampere+ GPUs (L4/A100/H100).
+    #[arg(long)]
+    dtype: Option<String>,
+    /// Shorthand for --dtype flex32 (mixed precision via FP16 Tensor Cores + FP32 storage)
+    #[arg(long)]
+    amp: bool,
+    /// Gradient accumulation steps (simulates larger batch size with less memory)
+    #[arg(long, default_value_t = 1)]
+    grad_accum_steps: usize,
+    /// Enable activation checkpointing to reduce peak training VRAM
+    #[arg(long)]
+    grad_checkpointing: bool,
+    /// Multi-GPU strategy on multi-CUDA machines (auto, sharded, ddp, off)
+    #[arg(long, default_value = "auto")]
+    multi_gpu: String,
+    /// Disable the interactive TUI and print plain CLI progress logs
+    /// (recommended for notebooks like Google Colab and non-TTY log capture)
+    #[arg(long)]
+    no_tui: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    Train {
-        /// Model size preset (nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl)
-        #[arg(long, default_value = "nano")]
-        model: String,
-        /// Dataset to train on (shakespeare, wikitext103)
-        #[arg(long, default_value = "shakespeare")]
-        dataset: String,
-        /// Override preset: number of transformer layers
-        #[arg(long)]
-        n_layer: Option<usize>,
-        /// Override preset: number of attention heads
-        #[arg(long)]
-        n_head: Option<usize>,
-        /// Override preset: number of key/value heads for GQA (Grouped-Query Attention)
-        #[arg(long)]
-        n_kv_head: Option<usize>,
-        /// Override preset: embedding dimension
-        #[arg(long)]
-        n_embd: Option<usize>,
-        /// Override preset: context window size
-        #[arg(long)]
-        block_size: Option<usize>,
-        /// Override preset: dropout probability
-        #[arg(long)]
-        dropout: Option<f64>,
-        /// Training batch size
-        #[arg(long, default_value_t = 32)]
-        batch_size: usize,
-        /// Number of dataloader workers
-        #[arg(long, default_value_t = 4)]
-        num_workers: usize,
-        /// Learning rate
-        #[arg(long, default_value_t = 1e-3)]
-        learning_rate: f64,
-        /// Number of training epochs
-        #[arg(long, default_value_t = 10)]
-        num_epochs: usize,
-        /// Warmup steps before cosine decay (0 = no warmup)
-        #[arg(long, default_value_t = 100)]
-        warmup_iters: usize,
-        /// Cap training items (0 = use full dataset; useful for smoke tests)
-        #[arg(long, default_value_t = 0)]
-        max_train_items: usize,
-        /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
-        #[arg(long, default_value_t = 10000.0)]
-        rope_theta: f64,
-        /// Floating-point precision (f32, flex32, bf16, f16).
-        /// flex32 uses FP16 Tensor Cores with FP32 storage/accumulation (recommended on T4/wgpu);
-        /// bf16 halves VRAM on Ampere+ GPUs (L4/A100/H100).
-        #[arg(long)]
-        dtype: Option<String>,
-        /// Shorthand for --dtype flex32 (mixed precision via FP16 Tensor Cores + FP32 storage)
-        #[arg(long)]
-        amp: bool,
-        /// Gradient accumulation steps (simulates larger batch size with less memory)
-        #[arg(long, default_value_t = 1)]
-        grad_accum_steps: usize,
-        /// Enable activation checkpointing to reduce peak training VRAM
-        #[arg(long)]
-        grad_checkpointing: bool,
-        /// Multi-GPU strategy on multi-CUDA machines (auto, sharded, ddp, off)
-        #[arg(long, default_value = "auto")]
-        multi_gpu: String,
-        /// Disable the interactive TUI and print plain CLI progress logs
-        /// (recommended for notebooks like Google Colab and non-TTY log capture)
-        #[arg(long)]
-        no_tui: bool,
-    },
+    Train(Box<TrainArgs>),
     Generate {
         #[arg(long, default_value = "artifacts")]
         artifact_dir: String,
@@ -116,6 +131,9 @@ enum Commands {
         /// Floating-point precision for inference (f32, flex32, bf16, f16)
         #[arg(long, default_value = "f32")]
         dtype: String,
+        /// Load best validation checkpoint (`model_best.bpk`) instead of `model_final.bpk`
+        #[arg(long)]
+        best: bool,
     },
 }
 
@@ -170,29 +188,34 @@ fn main() -> anyhow::Result<()> {
     let cpu = cli.cpu;
 
     match cli.command {
-        Commands::Train {
-            model,
-            dataset,
-            n_layer,
-            n_head,
-            n_kv_head,
-            n_embd,
-            block_size,
-            dropout,
-            batch_size,
-            num_workers,
-            learning_rate,
-            num_epochs,
-            warmup_iters,
-            max_train_items,
-            rope_theta,
-            dtype,
-            amp,
-            grad_accum_steps,
-            grad_checkpointing,
-            multi_gpu,
-            no_tui,
-        } => {
+        Commands::Train(args) => {
+            let TrainArgs {
+                model,
+                dataset,
+                n_layer,
+                n_head,
+                n_kv_head,
+                n_embd,
+                block_size,
+                dropout,
+                batch_size,
+                num_workers,
+                learning_rate,
+                num_epochs,
+                warmup_iters,
+                max_train_items,
+                max_val_items,
+                artifact_dir,
+                resume,
+                optimizer,
+                rope_theta,
+                dtype,
+                amp,
+                grad_accum_steps,
+                grad_checkpointing,
+                multi_gpu,
+                no_tui,
+            } = *args;
             let preset = model
                 .parse::<ModelPreset>()
                 .expect("Invalid --model. Use: nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl");
@@ -212,6 +235,7 @@ fn main() -> anyhow::Result<()> {
             let dataset_enum = Dataset::from_str(&dataset)
                 .expect("Invalid --dataset. Use: shakespeare, wikitext103");
             let multi_gpu_mode = MultiGpuMode::from_str(&multi_gpu)?;
+            let optimizer_choice = OptimizerChoice::from_str(&optimizer)?;
             let float_dtype = match &dtype {
                 Some(d) => parse_float_dtype(d)?,
                 None if amp => FloatDType::Flex32,
@@ -255,6 +279,9 @@ fn main() -> anyhow::Result<()> {
                 warmup_iters,
                 num_epochs,
                 max_train_items,
+                max_val_items,
+                artifact_dir,
+                resume_epoch: resume,
                 amp: amp || float_dtype != FloatDType::F32,
                 grad_accum_steps,
                 grad_checkpointing,
@@ -272,13 +299,14 @@ fn main() -> anyhow::Result<()> {
             println!("Dataset: {}", dataset);
             println!("Devices ({}): {:?}", devices.len(), devices);
             println!(
-                "Precision: {:?}  |  Grad checkpointing: {}  |  Multi-GPU: {:?}",
-                float_dtype, grad_checkpointing, multi_gpu_mode
+                "Precision: {:?}  |  Optimizer: {:?}  |  Grad checkpointing: {}  |  Multi-GPU: {:?}",
+                float_dtype, optimizer_choice, grad_checkpointing, multi_gpu_mode
             );
 
             run_training(
                 devices,
                 multi_gpu_mode,
+                optimizer_choice,
                 dataset_enum,
                 gpt_config,
                 training_config,
@@ -293,6 +321,7 @@ fn main() -> anyhow::Result<()> {
             top_p,
             repetition_penalty,
             dtype,
+            best,
         } => {
             let mut device = select_device(cpu);
             let float_dtype = parse_float_dtype(&dtype)?;
@@ -312,11 +341,19 @@ fn main() -> anyhow::Result<()> {
                 top_p,
                 repetition_penalty,
             };
+            let model_name = if best { "model_best" } else { "model_final" };
             println!(
-                "Generating text on device: {:?} (dtype: {:?})",
-                device, float_dtype
+                "Generating text on device: {:?} (dtype: {:?}, model: {})",
+                device, float_dtype, model_name
             );
-            generate_text(device, &artifact_dir, &prompt, max_tokens, &sampling);
+            generate_text(
+                device,
+                &artifact_dir,
+                model_name,
+                &prompt,
+                max_tokens,
+                &sampling,
+            );
         }
     }
 

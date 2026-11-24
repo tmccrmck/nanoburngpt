@@ -16,11 +16,11 @@ BRANCH = "main"
 MODEL = "gpt2-small"
 DATASET = "shakespeare"
 OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
-DTYPE = "flex32"  # flex32 unlocks FP16 Tensor Cores on T4 with FP32 storage
-MULTI_GPU = "auto"  # auto uses 1x T4 for flex32 (NCCL rejects flex32) or 2x for f32/bf16
+DTYPE = "f32"  # f32 enables 2x T4 OptimSharded and avoids Burn 0.22.1 Flex32 FlashAttn valid bug on T4
+MULTI_GPU = "sharded"  # OptimSharded across both Kaggle T4 GPUs
 GRAD_CHECKPOINTING = False
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 4  # 1x T4 x batch 8 x accum 4 = effective batch 32 sequences (matches v2 baseline)
+GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences (matches v2 baseline)
 BLOCK_SIZE = 256  # 0 = use preset default
 NUM_EPOCHS = 10
 LEARNING_RATE = 3e-4
@@ -33,7 +33,7 @@ MAX_TRAIN_ITEMS = 0
 GENERATE_PROMPT = "HAMLET:\n"
 GENERATE_TOKENS = 200
 REPETITION_PENALTY = 1.1
-GENERATE_DTYPE = "f16"
+GENERATE_DTYPE = "f32"
 USE_BEST_CHECKPOINT = True
 
 REPO_DIR = Path("/tmp/nanoburngpt")

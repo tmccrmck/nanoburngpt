@@ -13,22 +13,22 @@ from pathlib import Path
 REPO_URL = "https://github.com/tmccrmck/nanoburngpt.git"
 BRANCH = "main"
 
-MODEL = "gpt2-small"
+MODEL = "nano"
 DATASET = "shakespeare"
 OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
-DTYPE = "f32"  # f32 enables 2x T4 OptimSharded and avoids Burn 0.22.1 Flex32 FlashAttn valid bug on T4
-MULTI_GPU = "sharded"  # OptimSharded across both Kaggle T4 GPUs
+DTYPE = "f32"  # f32 enables 2x T4 multi-GPU and avoids Burn 0.22.1 Flex32 FlashAttn valid bug on T4
+MULTI_GPU = "ddp"  # test 2x T4 NCCL DDP with NCCL_P2P_DISABLE=1
 GRAD_CHECKPOINTING = False
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences (matches v2 baseline)
+GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences
 BLOCK_SIZE = 256  # 0 = use preset default
-NUM_EPOCHS = 10
+NUM_EPOCHS = 1
 LEARNING_RATE = 3e-4
-WARMUP_ITERS = 30
+WARMUP_ITERS = 2
 NUM_WORKERS = 2
-# 0 = full dataset (e.g. set MAX_TRAIN_ITEMS = 4000, MODEL = "nano",
+# 0 = full dataset (e.g. set MAX_TRAIN_ITEMS = 128, MODEL = "nano",
 # NUM_EPOCHS = 1 for a quick end-to-end smoke test).
-MAX_TRAIN_ITEMS = 0
+MAX_TRAIN_ITEMS = 128
 
 GENERATE_PROMPT = "HAMLET:\n"
 GENERATE_TOKENS = 200
@@ -152,8 +152,13 @@ def main() -> None:
     if MAX_TRAIN_ITEMS > 0:
         train_cmd += ["--max-train-items", str(MAX_TRAIN_ITEMS)]
 
+    train_env = os.environ.copy()
+    # Virtualized 2x T4 PCIe VMs without NVLink often hang on NCCL P2P collectives.
+    train_env.setdefault("NCCL_P2P_DISABLE", "1")
+    train_env.setdefault("NCCL_IB_DISABLE", "1")
+
     t0 = time.monotonic()
-    run(train_cmd)
+    run(train_cmd, env=train_env)
     print(f"Training completed in {time.monotonic() - t0:.1f}s", flush=True)
 
     # 5. Generate sample text from trained checkpoint

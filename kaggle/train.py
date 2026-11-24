@@ -15,8 +15,11 @@ BRANCH = "main"
 
 MODEL = "gpt2-small"
 DATASET = "shakespeare"
+DTYPE = "flex32"  # flex32 unlocks FP16 Tensor Cores on T4 with FP32 storage
+MULTI_GPU = "auto"  # auto uses OptimSharded across both Kaggle T4 GPUs
+GRAD_CHECKPOINTING = False
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 4
+GRAD_ACCUM_STEPS = 2  # x2 GPUs x batch 8 = effective batch 32 sequences
 BLOCK_SIZE = 256  # 0 = use preset default
 NUM_EPOCHS = 10
 LEARNING_RATE = 3e-4
@@ -29,6 +32,7 @@ MAX_TRAIN_ITEMS = 0
 GENERATE_PROMPT = "HAMLET:\n"
 GENERATE_TOKENS = 200
 REPETITION_PENALTY = 1.1
+GENERATE_DTYPE = "f16"
 
 REPO_DIR = Path("/tmp/nanoburngpt")
 OUTPUT_DIR = Path("/kaggle/working")
@@ -121,13 +125,15 @@ def main() -> None:
 
     binary = str(binary_path)
 
-    # 6. Train on GPU
-    banner(f"Training ({MODEL} on {DATASET})")
+    # 4. Train on GPU
+    banner(f"Training ({MODEL} on {DATASET}, dtype={DTYPE}, multi_gpu={MULTI_GPU})")
     train_cmd = [
         binary,
         "train",
         "--model", MODEL,
         "--dataset", DATASET,
+        "--dtype", DTYPE,
+        "--multi-gpu", MULTI_GPU,
         "--batch-size", str(BATCH_SIZE),
         "--grad-accum-steps", str(GRAD_ACCUM_STEPS),
         "--num-epochs", str(NUM_EPOCHS),
@@ -136,6 +142,8 @@ def main() -> None:
         "--num-workers", str(NUM_WORKERS),
         "--no-tui",
     ]
+    if GRAD_CHECKPOINTING:
+        train_cmd.append("--grad-checkpointing")
     if BLOCK_SIZE > 0:
         train_cmd += ["--block-size", str(BLOCK_SIZE)]
     if MAX_TRAIN_ITEMS > 0:
@@ -157,6 +165,7 @@ def main() -> None:
         "--top-k", "40",
         "--top-p", "0.95",
         "--repetition-penalty", str(REPETITION_PENALTY),
+        "--dtype", GENERATE_DTYPE,
     ])
 
     # 6. Export artifacts and CUDA binary to /kaggle/working

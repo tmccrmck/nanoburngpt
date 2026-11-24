@@ -44,8 +44,11 @@ Options:
   --warmup-iters <N>      Linear warmup steps           [default: 100]
   --max-train-items <N>   Cap dataset size (0=full)     [default: 0]
   --grad-accum-steps <N>  Gradient accumulation steps   [default: 1]
+  --grad-checkpointing    Enable activation checkpointing to save VRAM
   --rope-theta <F>        RoPE frequency base           [default: 10000.0]
-  --amp                   No-op on Burn 0.22 (training runs in f32)
+  --dtype <DTYPE>         Precision: f32, flex32, bf16, f16 [default: f32]
+  --amp                   Shorthand for --dtype flex32 (FP16 Tensor Cores + FP32 storage)
+  --multi-gpu <MODE>      Multi-GPU mode: auto, sharded, ddp, off [default: auto]
   --no-tui                Disable interactive TUI; print plain CLI logs
 ```
 
@@ -65,6 +68,7 @@ Options:
   --top-k <N>                Top-k sampling (0 = disabled)    [default: 0]
   --top-p <F>                Nucleus sampling (1.0 = all)     [default: 1.0]
   --repetition-penalty <F>   Repetition penalty (1.0 = off)   [default: 1.0]
+  --dtype <DTYPE>            Precision: f32, flex32, bf16, f16 [default: f32]
 ```
 
 ## Model Presets

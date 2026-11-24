@@ -70,11 +70,20 @@ pub struct TextDatasetItem {
 #[derive(Clone, Debug)]
 pub struct TextGenerationBatcher {
     block_size: usize,
+    loss_scale: f64,
 }
 
 impl TextGenerationBatcher {
     pub fn new(block_size: usize) -> Self {
-        Self { block_size }
+        Self {
+            block_size,
+            loss_scale: 1.0,
+        }
+    }
+
+    pub fn with_loss_scale(mut self, loss_scale: f64) -> Self {
+        self.loss_scale = loss_scale;
+        self
     }
 }
 
@@ -82,6 +91,7 @@ impl TextGenerationBatcher {
 pub struct TextGenerationBatch {
     pub inputs: Tensor<2, Int>,
     pub targets: Tensor<2, Int>,
+    pub loss_scale: f64,
 }
 
 impl Batcher<TextDatasetItem, TextGenerationBatch> for TextGenerationBatcher {
@@ -99,7 +109,11 @@ impl Batcher<TextDatasetItem, TextGenerationBatch> for TextGenerationBatcher {
         let targets = Tensor::<1, Int>::from_ints(targets_flat.as_slice(), device)
             .reshape([batch_size, self.block_size]);
 
-        TextGenerationBatch { inputs, targets }
+        TextGenerationBatch {
+            inputs,
+            targets,
+            loss_scale: self.loss_scale,
+        }
     }
 }
 

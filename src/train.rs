@@ -1,3 +1,6 @@
+use std::str::FromStr;
+use std::sync::Arc;
+
 use crate::{
     data::{BpeTokenizer, TextGenerationBatch, TextGenerationBatcher, load_text},
     datasets::Dataset,
@@ -14,14 +17,50 @@ use burn::{
         lr_scheduler::{LrScheduler, LrSchedulerRecord},
     },
     prelude::*,
+    tensor::{
+        ExecutionError, TensorReadError,
+        distributed::{DistributedConfig, ReduceOperation},
+    },
     train::{
-        ClassificationOutput, InferenceStep, Learner, SupervisedTraining, TrainOutput, TrainStep,
+        ExecutionStrategy, InferenceStep, Learner, MultiDeviceOptim, SupervisedTraining,
+        TrainOutput, TrainStep, TrainingStrategy,
         checkpoint::MetricCheckpointingStrategy,
-        metric::store::{Aggregate, Direction, Split},
-        metric::{AccuracyMetric, LossMetric, PerplexityMetric},
+        metric::{
+            Adaptor, ItemLazy, LossInput, LossMetric, Metric, MetricAttributes, MetricMetadata,
+            MetricName, Numeric, NumericAttributes, NumericEntry, SerializedEntry,
+            store::{Aggregate, Direction, Split},
+        },
         renderer::CliMetricsRenderer,
     },
 };
+
+// ---------------------------------------------------------------------------
+// Multi-GPU strategy selection
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MultiGpuMode {
+    Off,
+    Auto,
+    Sharded,
+    Ddp,
+}
+
+impl FromStr for MultiGpuMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "auto" => Ok(Self::Auto),
+            "sharded" => Ok(Self::Sharded),
+            "ddp" => Ok(Self::Ddp),
+            other => anyhow::bail!(
+                "Unknown --multi-gpu mode '{other}'. Available: auto, sharded, ddp, off"
+            ),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Training configuration
@@ -44,12 +83,15 @@ pub struct TrainingConfig {
     /// 0 = full dataset; positive value caps training items (smoke tests).
     #[config(default = 0)]
     pub max_train_items: usize,
-    /// Enable mixed precision (AMP)
+    /// Enable mixed precision (AMP / Flex32)
     #[config(default = false)]
     pub amp: bool,
     /// Gradient accumulation steps (1 = no accumulation)
     #[config(default = 1)]
     pub grad_accum_steps: usize,
+    /// Enable activation checkpointing to reduce training VRAM
+    #[config(default = false)]
+    pub grad_checkpointing: bool,
     /// Disable the interactive TUI and use plain CLI progress output
     #[config(default = false)]
     pub no_tui: bool,
@@ -118,48 +160,206 @@ impl LrScheduler for WarmupCosineScheduler {
 }
 
 // ---------------------------------------------------------------------------
+// Lightweight scalar-loss output & perplexity metric (avoids retaining logits)
+// ---------------------------------------------------------------------------
+
+/// Training/validation output carrying only the scalar loss and token count so
+/// the `[batch * seq, vocab]` logits tensor is freed immediately after loss
+/// computation instead of being retained across Burn's async metric channel.
+pub struct LmLossOutput {
+    pub loss: Tensor<1>,
+    pub num_tokens: usize,
+}
+
+impl ItemLazy for LmLossOutput {
+    fn sync(self) -> Result<Self, ExecutionError> {
+        self.loss.device().flush()?;
+        Ok(Self {
+            loss: self.loss.without_autodiff(),
+            num_tokens: self.num_tokens,
+        })
+    }
+}
+
+impl Adaptor<LossInput> for LmLossOutput {
+    fn adapt(&self) -> LossInput {
+        LossInput::new(self.loss.clone())
+    }
+}
+
+pub struct LossPerplexityInput {
+    pub loss: Tensor<1>,
+    pub num_tokens: usize,
+}
+
+impl Adaptor<LossPerplexityInput> for LmLossOutput {
+    fn adapt(&self) -> LossPerplexityInput {
+        LossPerplexityInput {
+            loss: self.loss.clone(),
+            num_tokens: self.num_tokens,
+        }
+    }
+}
+
+/// Computes perplexity directly from the scalar cross-entropy loss (`exp(NLL / tokens)`),
+/// avoiding Burn's default `PerplexityMetric` which recomputes a second full `log_softmax`
+/// over the 50,257-token vocabulary on every micro-batch.
+#[derive(Clone)]
+pub struct LossPerplexityMetric {
+    name: MetricName,
+    sum_nll: f64,
+    total_tokens: usize,
+    current_ppl: f64,
+    current_tokens: usize,
+}
+
+impl Default for LossPerplexityMetric {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LossPerplexityMetric {
+    pub fn new() -> Self {
+        Self {
+            name: Arc::new("Perplexity".to_string()),
+            sum_nll: 0.0,
+            total_tokens: 0,
+            current_ppl: f64::NAN,
+            current_tokens: 0,
+        }
+    }
+
+    fn running_ppl(&self) -> f64 {
+        if self.total_tokens > 0 {
+            (self.sum_nll / self.total_tokens as f64).exp()
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn format_entry(&self, final_entry: bool) -> SerializedEntry {
+        let epoch_ppl = self.running_ppl();
+        let formatted = format!("epoch {epoch_ppl:.2} - batch {:.2}", self.current_ppl);
+        let serialized = if final_entry {
+            NumericEntry::Final(epoch_ppl).serialize()
+        } else {
+            NumericEntry::Aggregated {
+                aggregated_value: self.current_ppl,
+                count: self.current_tokens,
+            }
+            .serialize()
+        };
+        SerializedEntry::new(formatted, serialized)
+    }
+}
+
+impl Metric for LossPerplexityMetric {
+    type Input = LossPerplexityInput;
+
+    fn update(
+        &mut self,
+        item: &Self::Input,
+        _metadata: &MetricMetadata,
+    ) -> Result<SerializedEntry, TensorReadError> {
+        let mean_loss = item.loss.clone().mean().try_into_scalar::<f64>()?;
+        self.sum_nll += mean_loss * item.num_tokens as f64;
+        self.total_tokens += item.num_tokens;
+        self.current_ppl = mean_loss.exp();
+        self.current_tokens = item.num_tokens;
+        Ok(self.format_entry(false))
+    }
+
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError> {
+        Ok(self.format_entry(true))
+    }
+
+    fn clear(&mut self) {
+        self.sum_nll = 0.0;
+        self.total_tokens = 0;
+        self.current_ppl = f64::NAN;
+        self.current_tokens = 0;
+    }
+
+    fn name(&self) -> MetricName {
+        self.name.clone()
+    }
+
+    fn attributes(&self) -> MetricAttributes {
+        NumericAttributes {
+            unit: None,
+            higher_is_better: false,
+        }
+        .into()
+    }
+}
+
+impl Numeric for LossPerplexityMetric {
+    fn value(&self) -> Option<NumericEntry> {
+        Some(NumericEntry::Aggregated {
+            aggregated_value: self.current_ppl,
+            count: self.current_tokens,
+        })
+    }
+
+    fn running_value(&self) -> Option<NumericEntry> {
+        Some(NumericEntry::Aggregated {
+            aggregated_value: self.running_ppl(),
+            count: self.total_tokens,
+        })
+    }
+
+    fn final_value(&self) -> NumericEntry {
+        NumericEntry::Final(self.running_ppl())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Model training/inference steps
 // ---------------------------------------------------------------------------
 
 impl GPT {
-    pub fn forward_classification(&self, item: TextGenerationBatch) -> ClassificationOutput {
+    pub fn forward_loss(&self, item: TextGenerationBatch) -> LmLossOutput {
         let targets = item.targets; // [batch, seq]
         let [batch_size, seq_len] = targets.dims();
+        let num_tokens = batch_size * seq_len;
 
         let logits = self.forward(item.inputs); // [batch, seq, vocab]
         let [_, _, vocab_size] = logits.dims();
 
-        let logits_flat = logits.reshape([batch_size * seq_len, vocab_size]);
-        let targets_flat = targets.reshape([batch_size * seq_len]);
+        let logits_flat = logits.reshape([num_tokens, vocab_size]);
+        let targets_flat = targets.reshape([num_tokens]);
 
         let loss = CrossEntropyLossConfig::new()
             .init(&logits_flat.device())
-            .forward(logits_flat.clone(), targets_flat.clone());
+            .forward(logits_flat, targets_flat);
 
-        ClassificationOutput {
-            loss,
-            output: logits_flat,
-            targets: targets_flat,
-        }
+        LmLossOutput { loss, num_tokens }
     }
 }
 
 impl TrainStep for GPT {
     type Input = TextGenerationBatch;
-    type Output = ClassificationOutput;
+    type Output = LmLossOutput;
 
-    fn step(&self, item: TextGenerationBatch) -> TrainOutput<ClassificationOutput> {
-        let item = self.forward_classification(item);
-        TrainOutput::new(self, item.loss.backward(), item)
+    fn step(&self, item: TextGenerationBatch) -> TrainOutput<LmLossOutput> {
+        let loss_scale = item.loss_scale;
+        let out = self.forward_loss(item);
+        let grads = if (loss_scale - 1.0).abs() > 1e-9 {
+            (out.loss.clone() * loss_scale).backward()
+        } else {
+            out.loss.backward()
+        };
+        TrainOutput::new(self, grads, out)
     }
 }
 
 impl InferenceStep for GPT {
     type Input = TextGenerationBatch;
-    type Output = ClassificationOutput;
+    type Output = LmLossOutput;
 
-    fn step(&self, item: TextGenerationBatch) -> ClassificationOutput {
-        self.forward_classification(item)
+    fn step(&self, item: TextGenerationBatch) -> LmLossOutput {
+        self.forward_loss(item)
     }
 }
 
@@ -171,21 +371,39 @@ pub(crate) fn compute_total_optimizer_steps(
     dataset_len: usize,
     batch_size: usize,
     grad_accum_steps: usize,
+    num_devices: usize,
     num_epochs: usize,
 ) -> usize {
     let batch_size = batch_size.max(1);
     let grad_accum = grad_accum_steps.max(1);
-    let micro_steps_per_epoch = dataset_len.div_ceil(batch_size);
+    let num_devices = num_devices.max(1);
+    let per_device_len = dataset_len.div_ceil(num_devices);
+    let micro_steps_per_epoch = per_device_len.div_ceil(batch_size);
     let opt_steps_per_epoch = micro_steps_per_epoch.div_ceil(grad_accum);
     opt_steps_per_epoch * num_epochs
 }
 
 pub fn run_training(
-    device: Device,
+    devices: Vec<Device>,
+    multi_gpu: MultiGpuMode,
     dataset: Dataset,
     mut gpt_config: GPTConfig,
     training_config: TrainingConfig,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(!devices.is_empty(), "At least one training device is required");
+
+    let use_multi = devices.len() > 1 && multi_gpu != MultiGpuMode::Off;
+    let num_devices = if use_multi { devices.len() } else { 1 };
+    let grad_accum = training_config.grad_accum_steps.max(1);
+
+    // Burn's GradientsAccumulator sums across micro-batches, and MultiDeviceLearningStrategy
+    // sums across devices (whereas DDP uses ncclAvg mean reduction across devices).
+    let loss_scale = if use_multi && multi_gpu != MultiGpuMode::Ddp {
+        1.0 / (grad_accum * num_devices) as f64
+    } else {
+        1.0 / grad_accum as f64
+    };
+
     // --- Data ---
     let data_path = dataset.ensure_downloaded()?;
     let (train_dataset, val_dataset) = load_text(&data_path, gpt_config.block_size)?;
@@ -206,20 +424,22 @@ pub fn run_training(
         .map_err(|e| anyhow::anyhow!("Failed to save config: {e:?}"))?;
 
     // Compute total optimizer steps for the LR schedule (Burn steps LR once per optimizer update)
-    let micro_steps_per_epoch = train_dataset.len().div_ceil(training_config.batch_size.max(1));
+    let per_device_len = train_dataset.len().div_ceil(num_devices);
+    let micro_steps_per_epoch = per_device_len.div_ceil(training_config.batch_size.max(1));
     let total_iters = compute_total_optimizer_steps(
         train_dataset.len(),
         training_config.batch_size,
-        training_config.grad_accum_steps,
+        grad_accum,
+        num_devices,
         training_config.num_epochs,
     );
     println!(
-        "Micro-steps/epoch: {micro_steps_per_epoch}  |  Optimizer steps: {total_iters} (accum={})  |  Warmup: {}",
-        training_config.grad_accum_steps.max(1),
+        "Devices: {num_devices}  |  Micro-steps/epoch/dev: {micro_steps_per_epoch}  |  Optimizer steps: {total_iters} (accum={grad_accum}, loss_scale={loss_scale:.4})  |  Warmup: {}",
         training_config.warmup_iters
     );
 
-    let batcher_train = TextGenerationBatcher::new(gpt_config.block_size);
+    let batcher_train =
+        TextGenerationBatcher::new(gpt_config.block_size).with_loss_scale(loss_scale);
     let batcher_val = TextGenerationBatcher::new(gpt_config.block_size);
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
@@ -251,32 +471,56 @@ pub fn run_training(
         total_iters.max(1),
     );
 
-    let device = device.autodiff();
-    let model = GPT::new(&gpt_config, &device);
+    let main_device = if training_config.grad_checkpointing {
+        devices[0].clone().autodiff().gradient_checkpointing()
+    } else {
+        devices[0].clone().autodiff()
+    };
+    let model = GPT::new(&gpt_config, &main_device);
     let learner = Learner::new(model, optim, lr_scheduler);
 
     let strategy = MetricCheckpointingStrategy::new(
-        &PerplexityMetric::new(),
+        &LossPerplexityMetric::new(),
         Aggregate::Mean,
         Direction::Lowest,
         Split::Valid,
     );
 
+    let exec_strategy = if !use_multi {
+        ExecutionStrategy::single(devices[0].clone())
+    } else {
+        match multi_gpu {
+            MultiGpuMode::Ddp => ExecutionStrategy::ddp(
+                devices,
+                DistributedConfig {
+                    all_reduce_op: ReduceOperation::Mean,
+                },
+            ),
+            MultiGpuMode::Auto | MultiGpuMode::Sharded => {
+                ExecutionStrategy::multi(devices, MultiDeviceOptim::OptimSharded)
+            }
+            MultiGpuMode::Off => ExecutionStrategy::single(devices[0].clone()),
+        }
+    };
+
     let mut training = SupervisedTraining::new("artifacts", dataloader_train, dataloader_val)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
-        .metric_train_numeric(AccuracyMetric::new())
-        .metric_valid_numeric(AccuracyMetric::new())
-        .metric_train_numeric(PerplexityMetric::new())
-        .metric_valid_numeric(PerplexityMetric::new())
+        .metric_train_numeric(LossPerplexityMetric::new())
+        .metric_valid_numeric(LossPerplexityMetric::new())
         .with_default_checkpointers()
         .with_checkpointing_strategy(strategy)
         .with_application_logger(None)
+        .with_training_strategy(TrainingStrategy::Default(exec_strategy))
         .num_epochs(training_config.num_epochs)
         .summary();
 
-    if training_config.grad_accum_steps > 1 {
-        training = training.grads_accumulation(training_config.grad_accum_steps);
+    if training_config.grad_checkpointing {
+        training = training.gradient_checkpointing();
+    }
+
+    if grad_accum > 1 {
+        training = training.grads_accumulation(grad_accum);
     }
 
     if training_config.no_tui || cfg!(not(feature = "tui")) {
@@ -421,7 +665,7 @@ mod tests {
         // 2. Initial loss
         let item = BurnDataset::get(&dataset, 0).unwrap();
         let batch = batcher.batch(vec![item.clone()], &device);
-        let output = model.forward_classification(batch);
+        let output = model.forward_loss(batch);
         let initial_loss: f32 = output.loss.into_scalar();
 
         // 3. Train for 10 steps
@@ -433,7 +677,7 @@ mod tests {
 
         // 4. Final loss
         let batch = batcher.batch(vec![item.clone()], &device);
-        let output = model.forward_classification(batch);
+        let output = model.forward_loss(batch);
         let final_loss: f32 = output.loss.into_scalar();
 
         assert!(
@@ -445,13 +689,46 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_steps_account_for_grad_accum_and_partial_batches() {
-        assert_eq!(compute_total_optimizer_steps(100, 10, 1, 3), 30);
+    fn optimizer_steps_account_for_multi_gpu_and_grad_accum() {
+        assert_eq!(compute_total_optimizer_steps(100, 10, 1, 1, 3), 30);
         // 100 items / batch 10 = 10 micro-steps; accum 4 -> ceil(10/4) = 3 opt steps/epoch
-        assert_eq!(compute_total_optimizer_steps(100, 10, 4, 2), 6);
+        assert_eq!(compute_total_optimizer_steps(100, 10, 4, 1, 2), 6);
+        // 2 GPUs split 100 items -> 50 items/dev -> 5 micro-steps -> ceil(5/2) = 3 opt steps/epoch
+        assert_eq!(compute_total_optimizer_steps(100, 10, 2, 2, 2), 6);
         // Partial final batch: 101 items / batch 10 = 11 micro-steps
-        assert_eq!(compute_total_optimizer_steps(101, 10, 1, 1), 11);
-        // Zero grad_accum_steps safely treated as 1
-        assert_eq!(compute_total_optimizer_steps(10, 5, 0, 2), 4);
+        assert_eq!(compute_total_optimizer_steps(101, 10, 1, 1, 1), 11);
+        // Zero grad_accum_steps / num_devices safely treated as 1
+        assert_eq!(compute_total_optimizer_steps(10, 5, 0, 0, 2), 4);
+    }
+
+    #[test]
+    fn loss_perplexity_metric_matches_exp_weighted_mean_loss() {
+        let device = Device::flex();
+        let mut metric = LossPerplexityMetric::new();
+        let meta = MetricMetadata {
+            progress: burn::data::dataloader::Progress::new(0, 1, None),
+            iteration: Some(1),
+            lr: None,
+        };
+
+        let in1 = LossPerplexityInput {
+            loss: Tensor::<1>::from_floats([2.0], &device),
+            num_tokens: 10,
+        };
+        let in2 = LossPerplexityInput {
+            loss: Tensor::<1>::from_floats([4.0], &device),
+            num_tokens: 30,
+        };
+        metric.update(&in1, &meta).unwrap();
+        metric.update(&in2, &meta).unwrap();
+
+        // Weighted mean NLL = (2.0 * 10 + 4.0 * 30) / 40 = 3.5 -> exp(3.5)
+        let expected = 3.5_f64.exp();
+        match metric.final_value() {
+            NumericEntry::Final(ppl) => {
+                assert!((ppl - expected).abs() < 1e-5, "got {ppl}, expected {expected}");
+            }
+            other => panic!("unexpected final_value: {other:?}"),
+        }
     }
 }

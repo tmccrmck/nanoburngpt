@@ -10,13 +10,31 @@ use burn::{
 };
 use super::GPTConfig;
 
-/// Per-layer cached K and V tensors: [batch, n_head, cached_seq, head_dim].
-pub type LayerKV = (Tensor<4>, Tensor<4>);
+/// Per-layer pre-allocated K and V cache buffers: `[batch, n_kv_head, max_len, head_dim]`.
+/// Only positions `0..len` along dimension 2 contain populated entries.
+#[derive(Clone, Debug)]
+pub struct LayerKV {
+    pub k: Tensor<4>,
+    pub v: Tensor<4>,
+    pub len: usize,
+}
 
-/// KV cache across all layers. `layers[i]` holds (K, V) for block `i`.
+/// KV cache across all layers. `layers[i]` holds pre-allocated (K, V) buffers for block `i`.
 #[derive(Clone, Debug)]
 pub struct KVCache {
     pub layers: Vec<LayerKV>,
+}
+
+impl KVCache {
+    /// Number of cached token positions currently populated.
+    pub fn len(&self) -> usize {
+        self.layers.first().map_or(0, |l| l.len)
+    }
+
+    /// Whether the cache has zero populated positions.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Module, Debug)]
@@ -138,24 +156,69 @@ impl CausalSelfAttention {
         x: Tensor<3>,
         cache: Option<LayerKV>,
         pos_offset: usize,
+        max_len: usize,
     ) -> (Tensor<3>, LayerKV) {
-        let (q, mut k, mut v, batch_size, seq_len, _) = self.split_qkv(x);
+        let (q, mut k, v, batch_size, seq_len, head_dim) = self.split_qkv(x);
 
         let q = self.rope.apply(q, pos_offset);
         k = self.rope.apply(k, pos_offset);
 
-        if let Some((cached_k, cached_v)) = cache {
-            k = Tensor::cat(vec![cached_k, k], 2);
-            v = Tensor::cat(vec![cached_v, v], 2);
-        }
+        let new_len = pos_offset + seq_len;
+        let (mut k_buf, mut v_buf) = match cache {
+            Some(layer_kv) if layer_kv.k.dims()[2] >= new_len => (layer_kv.k, layer_kv.v),
+            Some(layer_kv) => {
+                let cap = new_len.max(layer_kv.k.dims()[2] * 2);
+                let pad = cap - layer_kv.k.dims()[2];
+                let device = k.device();
+                let zeros =
+                    Tensor::<4>::zeros([batch_size, self.n_kv_head, pad, head_dim], &device);
+                (
+                    Tensor::cat(vec![layer_kv.k, zeros.clone()], 2),
+                    Tensor::cat(vec![layer_kv.v, zeros], 2),
+                )
+            }
+            None => {
+                let cap = max_len.max(new_len);
+                let device = k.device();
+                (
+                    Tensor::<4>::zeros([batch_size, self.n_kv_head, cap, head_dim], &device),
+                    Tensor::<4>::zeros([batch_size, self.n_kv_head, cap, head_dim], &device),
+                )
+            }
+        };
 
-        let new_cache = (k.clone(), v.clone());
+        // In-place update when uniquely owned (avoiding O(T^2) Tensor::cat per decode step).
+        k_buf = k_buf.slice_assign(
+            [
+                0..batch_size,
+                0..self.n_kv_head,
+                pos_offset..new_len,
+                0..head_dim,
+            ],
+            k,
+        );
+        v_buf = v_buf.slice_assign(
+            [
+                0..batch_size,
+                0..self.n_kv_head,
+                pos_offset..new_len,
+                0..head_dim,
+            ],
+            v,
+        );
+
+        let k_valid = k_buf
+            .clone()
+            .slice([0..batch_size, 0..self.n_kv_head, 0..new_len, 0..head_dim]);
+        let v_valid = v_buf
+            .clone()
+            .slice([0..batch_size, 0..self.n_kv_head, 0..new_len, 0..head_dim]);
 
         let (k_att, v_att) = if self.n_kv_head < self.n_head {
             let reps = self.n_head / self.n_kv_head;
-            (k.repeat_dim(1, reps), v.repeat_dim(1, reps))
+            (k_valid.repeat_dim(1, reps), v_valid.repeat_dim(1, reps))
         } else {
-            (k, v)
+            (k_valid, v_valid)
         };
 
         let y = attention(
@@ -165,7 +228,8 @@ impl CausalSelfAttention {
             None,
             None,
             AttentionModuleOptions {
-                is_causal: true,
+                // Single-token decode attends to all cached positions; skip causal mask kernels.
+                is_causal: seq_len > 1,
                 ..Default::default()
             },
         );
@@ -174,6 +238,11 @@ impl CausalSelfAttention {
             .permute([0, 2, 1, 3])
             .reshape([batch_size, seq_len, self.n_embd]);
         let y = self.c_proj.forward(y);
+        let new_cache = LayerKV {
+            k: k_buf,
+            v: v_buf,
+            len: new_len,
+        };
         (self.resid_dropout.forward(y), new_cache)
     }
 }
@@ -267,10 +336,10 @@ mod tests {
         let expected_last = expected.slice([0..1, seq - 1..seq, 0..config.n_embd]);
 
         let prefix = x.clone().slice([0..1, 0..seq - 1, 0..config.n_embd]);
-        let (_, cache) = attn.forward_cached(prefix, None, 0);
+        let (_, cache) = attn.forward_cached(prefix, None, 0, config.block_size);
 
         let last = x.clone().slice([0..1, seq - 1..seq, 0..config.n_embd]);
-        let (cached, _) = attn.forward_cached(last, Some(cache), seq - 1);
+        let (cached, _) = attn.forward_cached(last, Some(cache), seq - 1, config.block_size);
 
         let diff = (expected_last - cached).abs().sum().into_scalar::<f32>();
         assert!(
@@ -297,10 +366,10 @@ mod tests {
         let expected_last = expected.slice([0..1, seq - 1..seq, 0..config.n_embd]);
 
         let prefix = x.clone().slice([0..1, 0..seq - 1, 0..config.n_embd]);
-        let (_, cache) = attn.forward_cached(prefix, None, 0);
+        let (_, cache) = attn.forward_cached(prefix, None, 0, config.block_size);
 
         let last = x.clone().slice([0..1, seq - 1..seq, 0..config.n_embd]);
-        let (cached, _) = attn.forward_cached(last, Some(cache), seq - 1);
+        let (cached, _) = attn.forward_cached(last, Some(cache), seq - 1, config.block_size);
 
         let diff = (expected_last - cached).abs().sum().into_scalar::<f32>();
         assert!(
@@ -324,11 +393,12 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t0, None, 0);
+        let (_, cache) = attn.forward_cached(t0, None, 0, config.block_size);
+        assert_eq!(cache.len, 1, "cache len should be 1 after first call");
         assert_eq!(
-            cache.0.dims(),
-            [1, config.n_head, 1, head_dim],
-            "cache K should have seq_len=1 after first call"
+            cache.k.dims(),
+            [1, config.n_head, config.block_size, head_dim],
+            "cache K should be pre-allocated to block_size"
         );
 
         let t1 = Tensor::<3>::random(
@@ -336,11 +406,12 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t1, Some(cache), 1);
+        let (_, cache) = attn.forward_cached(t1, Some(cache), 1, config.block_size);
+        assert_eq!(cache.len, 2, "cache len should be 2 after second call");
         assert_eq!(
-            cache.0.dims(),
-            [1, config.n_head, 2, head_dim],
-            "cache K should have seq_len=2 after second call"
+            cache.k.dims(),
+            [1, config.n_head, config.block_size, head_dim],
+            "cache K capacity should remain block_size"
         );
     }
 
@@ -359,11 +430,11 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t0, None, 0);
-        let (cached_k, _) = cache;
+        let (_, cache) = attn.forward_cached(t0, None, 0, config.block_size);
+        assert_eq!(cache.len, 1);
         assert_eq!(
-            cached_k.dims(),
-            [1, 2, 1, head_dim],
+            cache.k.dims(),
+            [1, 2, config.block_size, head_dim],
             "GQA cache should store n_kv_head=2 heads"
         );
 
@@ -372,18 +443,8 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(
-            t1,
-            Some((
-                cached_k,
-                Tensor::<4>::zeros([1, 2, 1, head_dim], &device),
-            )),
-            1,
-        );
-        assert_eq!(
-            cache.0.dims(),
-            [1, 2, 2, head_dim],
-            "GQA cache should have seq_len=2 after two calls"
-        );
+        let (_, cache) = attn.forward_cached(t1, Some(cache), 1, config.block_size);
+        assert_eq!(cache.len, 2, "GQA cache should have len=2 after two calls");
+        assert_eq!(cache.k.dims(), [1, 2, config.block_size, head_dim]);
     }
 }

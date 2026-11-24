@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = ["wgpu", "tui", "persistence"]
 wgpu = ["burn/wgpu"]
-cuda = ["burn/cuda"]
+cuda = ["burn/cuda", "dep:cubecl-cuda"]
 cpu = ["burn/flex"]
 # Enables the interactive ratatui dashboard during training. Disabling this
 # feature (e.g. `--no-default-features --features cuda`) excludes ratatui and
@@ -28,7 +28,9 @@ burn = { version = "0.22.1", default-features = false, features = [
     "rayon",
 ] }
 clap = { version = "4.6.0", features = ["derive"] }
-rand = "0.10.0"
+# Select CubeCL's NVRTC C++ backend instead of the experimental LLVM/pliron backend,
+# which panics on Flex32 intrinsics/constants in cubecl-llvm 0.11.4.
+cubecl-cuda = { version = "0.11.4", optional = true, default-features = false, features = ["cpp"] }
 tiktoken-rs = "0.9.1"
 ureq = "3"
 zip = { version = "2", default-features = false, features = ["deflate"] }

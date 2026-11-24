@@ -4553,7 +4553,7 @@ dependencies = [
  "burn",
  "clap",
  "criterion",
- "rand 0.10.3",
+ "cubecl-cuda",
  "tiktoken-rs",
  "ureq 3.4.2",
  "zip 2.4.2",

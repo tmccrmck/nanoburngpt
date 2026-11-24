@@ -2,17 +2,22 @@ use burn::{
     data::{dataloader::batcher::Batcher, dataset::{Dataset, DatasetError}},
     prelude::*,
 };
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 use tiktoken_rs::r50k_base;
 
 pub struct TextDataset {
-    pub data: Vec<usize>,
+    pub data: Arc<[i32]>,
     block_size: usize,
     max_len: Option<usize>,
 }
 
 impl TextDataset {
     pub fn new(data: Vec<usize>, block_size: usize) -> Self {
+        let tokens: Arc<[i32]> = data.into_iter().map(|t| t as i32).collect();
+        Self::from_tokens(tokens, block_size)
+    }
+
+    pub fn from_tokens(data: Arc<[i32]>, block_size: usize) -> Self {
         Self {
             data,
             block_size,
@@ -49,11 +54,11 @@ impl Dataset<TextDatasetItem> for TextDataset {
         }
 
         let start = index * self.block_size;
-        let chunk = &self.data[start..start + self.block_size + 1];
-        let input = chunk[..self.block_size].to_vec();
-        let target = chunk[1..].to_vec();
-
-        Ok(TextDatasetItem { input, target })
+        Ok(TextDatasetItem {
+            data: Arc::clone(&self.data),
+            start,
+            len: self.block_size,
+        })
     }
 
     fn len(&self) -> usize {
@@ -61,10 +66,24 @@ impl Dataset<TextDatasetItem> for TextDataset {
     }
 }
 
+/// Zero-copy slice handle into a shared token buffer (`Arc<[i32]>`).
 #[derive(Clone, Debug)]
 pub struct TextDatasetItem {
-    pub input: Vec<usize>,
-    pub target: Vec<usize>,
+    data: Arc<[i32]>,
+    start: usize,
+    len: usize,
+}
+
+impl TextDatasetItem {
+    #[inline]
+    pub fn input(&self) -> &[i32] {
+        &self.data[self.start..self.start + self.len]
+    }
+
+    #[inline]
+    pub fn target(&self) -> &[i32] {
+        &self.data[self.start + 1..self.start + self.len + 1]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,11 +116,11 @@ pub struct TextGenerationBatch {
 impl Batcher<TextDatasetItem, TextGenerationBatch> for TextGenerationBatcher {
     fn batch(&self, items: Vec<TextDatasetItem>, device: &Device) -> TextGenerationBatch {
         let batch_size = items.len();
-        let mut inputs_flat = Vec::with_capacity(batch_size * self.block_size);
-        let mut targets_flat = Vec::with_capacity(batch_size * self.block_size);
+        let mut inputs_flat = Vec::<i32>::with_capacity(batch_size * self.block_size);
+        let mut targets_flat = Vec::<i32>::with_capacity(batch_size * self.block_size);
         for item in &items {
-            inputs_flat.extend_from_slice(&item.input);
-            targets_flat.extend_from_slice(&item.target);
+            inputs_flat.extend_from_slice(item.input());
+            targets_flat.extend_from_slice(item.target());
         }
 
         let inputs = Tensor::<1, Int>::from_ints(inputs_flat.as_slice(), device)
@@ -162,11 +181,13 @@ impl BpeTokenizer {
 // ---------------------------------------------------------------------------
 
 /// Tokenize text from a file, cache the token IDs as a `.bin` for fast reloads.
-fn tokenize_and_cache(text_path: &Path, bin_path: &Path) -> anyhow::Result<Vec<usize>> {
+fn tokenize_and_cache(text_path: &Path, bin_path: &Path) -> anyhow::Result<Vec<i32>> {
     let text = std::fs::read_to_string(text_path)?;
     let tokenizer = BpeTokenizer::new();
-    let mut tokens = tokenizer.encode(&text);
-    tokens.insert(0, BpeTokenizer::BOS_TOKEN);
+    let encoded = tokenizer.encode(&text);
+    let mut tokens = Vec::with_capacity(encoded.len() + 1);
+    tokens.push(BpeTokenizer::BOS_TOKEN as i32);
+    tokens.extend(encoded.into_iter().map(|t| t as i32));
 
     let bytes: Vec<u8> = tokens
         .iter()
@@ -177,14 +198,25 @@ fn tokenize_and_cache(text_path: &Path, bin_path: &Path) -> anyhow::Result<Vec<u
     Ok(tokens)
 }
 
-/// Load a pre-tokenized `.bin` file (raw u32 LE tokens).
-fn load_cached(bin_path: &Path) -> anyhow::Result<Vec<usize>> {
+/// Load a pre-tokenized `.bin` file (raw u32 LE tokens) directly into `Vec<i32>`.
+fn load_cached(bin_path: &Path) -> anyhow::Result<Vec<i32>> {
     let bytes = std::fs::read(bin_path)?;
     let tokens = bytes
         .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as usize)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as i32)
         .collect();
     Ok(tokens)
+}
+
+/// Load a single text file (or its cached `.bin`) into a `TextDataset`.
+pub fn load_text_file(path: &Path, block_size: usize) -> anyhow::Result<TextDataset> {
+    let bin_path = path.with_extension("bin");
+    let data = if bin_path.exists() {
+        load_cached(&bin_path)?
+    } else {
+        tokenize_and_cache(path, &bin_path)?
+    };
+    Ok(TextDataset::from_tokens(Arc::from(data), block_size))
 }
 
 /// Load a text file (or its cached `.bin`), tokenize with BPE, prepend BOS,
@@ -200,10 +232,12 @@ pub fn load_text(path: &Path, block_size: usize) -> anyhow::Result<(TextDataset,
 
     let n = data.len();
     let split = (n as f64 * 0.9) as usize;
+    let train: Arc<[i32]> = Arc::from(&data[..split]);
+    let val: Arc<[i32]> = Arc::from(&data[split..]);
 
     Ok((
-        TextDataset::new(data[..split].to_vec(), block_size),
-        TextDataset::new(data[split..].to_vec(), block_size),
+        TextDataset::from_tokens(train, block_size),
+        TextDataset::from_tokens(val, block_size),
     ))
 }
 
@@ -231,12 +265,12 @@ mod tests {
     #[test]
     fn chunks_are_non_overlapping() {
         let ds = make_dataset(10, 3);
-        assert_eq!(ds.get(0).unwrap().input, vec![0, 1, 2]);
-        assert_eq!(ds.get(0).unwrap().target, vec![1, 2, 3]);
-        assert_eq!(ds.get(1).unwrap().input, vec![3, 4, 5]);
-        assert_eq!(ds.get(1).unwrap().target, vec![4, 5, 6]);
-        assert_eq!(ds.get(2).unwrap().input, vec![6, 7, 8]);
-        assert_eq!(ds.get(2).unwrap().target, vec![7, 8, 9]);
+        assert_eq!(ds.get(0).unwrap().input(), &[0, 1, 2]);
+        assert_eq!(ds.get(0).unwrap().target(), &[1, 2, 3]);
+        assert_eq!(ds.get(1).unwrap().input(), &[3, 4, 5]);
+        assert_eq!(ds.get(1).unwrap().target(), &[4, 5, 6]);
+        assert_eq!(ds.get(2).unwrap().input(), &[6, 7, 8]);
+        assert_eq!(ds.get(2).unwrap().target(), &[7, 8, 9]);
     }
 
     #[test]
@@ -250,8 +284,8 @@ mod tests {
         let ds = make_dataset(10, 4);
         let item = ds.get(0).expect("should exist");
         // tokens 0..4 → input, tokens 1..5 → target
-        assert_eq!(item.input, vec![0, 1, 2, 3]);
-        assert_eq!(item.target, vec![1, 2, 3, 4]);
+        assert_eq!(item.input(), &[0, 1, 2, 3]);
+        assert_eq!(item.target(), &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -259,10 +293,10 @@ mod tests {
         let block_size = 3;
         let n = 10;
         let ds = make_dataset(n, block_size);
-        let last = ds.len() - 1; // index 6: tokens [6,7,8] / [7,8,9]
+        let last = ds.len() - 1; // index 2: tokens [6,7,8] / [7,8,9]
         let item = ds.get(last).expect("should exist");
-        assert_eq!(item.input, vec![6, 7, 8]);
-        assert_eq!(item.target, vec![7, 8, 9]);
+        assert_eq!(item.input(), &[6, 7, 8]);
+        assert_eq!(item.target(), &[7, 8, 9]);
     }
 
     #[test]
@@ -310,7 +344,7 @@ mod tests {
         let loaded = super::load_cached(&bin_path).unwrap();
 
         assert_eq!(tokens, loaded, "cached and loaded tokens should match");
-        assert_eq!(tokens[0], BpeTokenizer::BOS_TOKEN, "BOS should be prepended");
+        assert_eq!(tokens[0], BpeTokenizer::BOS_TOKEN as i32, "BOS should be prepended");
 
         std::fs::remove_dir_all(&dir).ok();
     }

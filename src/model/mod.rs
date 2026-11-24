@@ -13,7 +13,7 @@ use burn::{
 };
 
 pub use self::attention::{CausalSelfAttention, KVCache, LayerKV};
-use self::sampling::sample_token;
+use self::sampling::{mark_seen_tokens, sample_token};
 pub use self::sampling::filter_top_k_p;
 pub use self::sampling::SamplingParams;
 
@@ -100,10 +100,11 @@ impl Block {
         x: Tensor<3>,
         cache: Option<LayerKV>,
         pos_offset: usize,
+        max_len: usize,
     ) -> (Tensor<3>, LayerKV) {
         let (attn_out, new_cache) =
             self.attn
-                .forward_cached(self.ln_1.forward(x.clone()), cache, pos_offset);
+                .forward_cached(self.ln_1.forward(x.clone()), cache, pos_offset, max_len);
         let x = x + attn_out;
         let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
         (x, new_cache)
@@ -165,28 +166,54 @@ impl GPT {
         idx: Tensor<2, Int>,
         cache: Option<KVCache>,
     ) -> (Tensor<3>, KVCache) {
-        let [batch, seq_len] = idx.dims();
+        let [_, seq_len] = idx.dims();
+        let max_len = cache
+            .as_ref()
+            .and_then(|c| c.layers.first())
+            .map_or(seq_len.max(64), |l| l.k.dims()[2]);
+        self.forward_cached_internal(idx, cache, max_len, false)
+    }
 
-        let pos_offset = cache.as_ref().map_or(0, |c| c.layers[0].0.dims()[2]);
+    #[inline]
+    fn forward_cached_internal(
+        &self,
+        idx: Tensor<2, Int>,
+        cache: Option<KVCache>,
+        max_len: usize,
+        last_token_only: bool,
+    ) -> (Tensor<3>, KVCache) {
+        let [batch, seq_len] = idx.dims();
+        let pos_offset = cache.as_ref().map_or(0, KVCache::len);
 
         let mut x = self.token_embedding.forward(idx);
 
+        // Move ownership of layer caches so `slice_assign` stays in-place (refcount == 1).
+        let mut prev_layers = cache.map(|c| c.layers.into_iter());
         let mut new_layers = Vec::with_capacity(self.blocks.len());
-        for (i, block) in self.blocks.iter().enumerate() {
-            let layer_cache = cache.as_ref().map(|c| c.layers[i].clone());
-            let (out, layer_kv) = block.forward_cached(x, layer_cache, pos_offset);
+        for block in &self.blocks {
+            let layer_cache = prev_layers.as_mut().and_then(Iterator::next);
+            let (out, layer_kv) = block.forward_cached(x, layer_cache, pos_offset, max_len);
             x = out;
             new_layers.push(layer_kv);
         }
+
+        // During prefill in `generate()`, only the final token's logits are needed;
+        // slicing before `ln_f` + `lm_head` saves seq_len× head compute and VRAM.
+        let (x, out_seq) = if last_token_only && seq_len > 1 {
+            let n_embd = x.dims()[2];
+            (x.slice([0..batch, (seq_len - 1)..seq_len, 0..n_embd]), 1)
+        } else {
+            (x, seq_len)
+        };
 
         let x = self.ln_f.forward(x);
 
         let weight = self.token_embedding.weight.val();
         let [vocab_size, n_embd] = weight.dims();
         let logits = x
-            .reshape([batch * seq_len, n_embd])
+            .reshape([batch * out_seq, n_embd])
             .matmul(weight.transpose())
-            .reshape([batch, seq_len, vocab_size]);
+            .reshape([batch, out_seq, vocab_size]);
 
         (
             logits,
@@ -196,7 +223,8 @@ impl GPT {
         )
     }
 
-    /// Auto-regressive generation with KV cache.
+    /// Auto-regressive generation with pre-allocated KV cache and sliding-window roll-over
+    /// past `block_size`.
     pub fn generate(
         &self,
         idx: Tensor<2, Int>,
@@ -211,35 +239,72 @@ impl GPT {
         } else {
             idx
         };
-        let [_, prompt_len] = idx.dims();
-        let steps = max_new_tokens.min(block_size.saturating_sub(prompt_len));
-        if steps == 0 {
+        if max_new_tokens == 0 || block_size == 0 {
             return idx;
         }
 
-        let (mut next_logits, mut cache) = self.forward_cached(idx.clone(), None);
-        let mut prev_tokens = idx.clone();
-        let mut generated: Vec<Tensor<2, Int>> = Vec::with_capacity(steps);
+        let (mut next_logits, mut cache) =
+            self.forward_cached_internal(idx.clone(), None, block_size, true);
 
-        for step in 0..steps {
+        let use_rep_penalty = sampling.repetition_penalty > 1.0 + 1e-6;
+        let mut seen_counts = if use_rep_penalty {
+            let vocab = next_logits.dims()[2];
+            let device = idx.device();
+            Some(mark_seen_tokens(
+                Tensor::<2>::zeros([batch, vocab], &device),
+                &idx,
+            ))
+        } else {
+            None
+        };
+
+        let mut history = idx.clone();
+        let mut generated: Vec<Tensor<2, Int>> = Vec::with_capacity(max_new_tokens);
+        let mut slide_start = 0usize;
+        let slide_keep = (block_size / 2).clamp(1, block_size.saturating_sub(1).max(1));
+
+        for step in 0..max_new_tokens {
             let [_, len, vocab] = next_logits.dims();
             let logits = next_logits
                 .slice([0..batch, len - 1..len, 0..vocab])
                 .reshape([batch, vocab]);
 
-            let idx_next = sample_token(&logits, sampling, &prev_tokens);
+            let idx_next = sample_token(&logits, sampling, seen_counts.as_ref());
 
             let token_id: i32 = idx_next.clone().slice([0..1, 0..1]).into_scalar();
             on_token(token_id);
 
             generated.push(idx_next.clone());
-            if step + 1 == steps {
+            if step + 1 == max_new_tokens {
                 break;
             }
-            prev_tokens = Tensor::cat(vec![prev_tokens, idx_next.clone()], 1);
-            let (step_logits, new_cache) = self.forward_cached(idx_next, Some(cache));
-            next_logits = step_logits;
-            cache = new_cache;
+
+            if let Some(seen) = seen_counts.take() {
+                seen_counts = Some(mark_seen_tokens(seen, &idx_next));
+            }
+
+            if cache.len() >= block_size {
+                // Sliding window: re-prefill the most recent `slide_keep` tokens from pos 0
+                // so RoPE positions always stay within `0..block_size`.
+                let mut window_parts = Vec::with_capacity(1 + (generated.len() - slide_start));
+                window_parts.push(history);
+                window_parts.extend(generated[slide_start..].iter().cloned());
+                let full_seq = Tensor::cat(window_parts, 1);
+                let total_len = full_seq.dims()[1];
+                let keep = slide_keep.min(total_len);
+                let window = full_seq.slice([0..batch, (total_len - keep)..total_len]);
+                history = window.clone();
+                slide_start = generated.len();
+                let (step_logits, new_cache) =
+                    self.forward_cached_internal(window, None, block_size, true);
+                next_logits = step_logits;
+                cache = new_cache;
+            } else {
+                let (step_logits, new_cache) =
+                    self.forward_cached_internal(idx_next, Some(cache), block_size, true);
+                next_logits = step_logits;
+                cache = new_cache;
+            }
         }
 
         let mut all = Vec::with_capacity(1 + generated.len());
@@ -340,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_respects_block_size_limit() {
+    fn generate_slides_window_past_block_size() {
         let device = test_device();
         let config = create_test_config();
         let gpt = GPT::new(&config, &device);
@@ -355,13 +420,12 @@ mod tests {
             repetition_penalty: 1.0,
         };
 
-        let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {});
-        let [_, total_len] = output.dims();
-        assert!(
-            total_len <= config.block_size,
-            "output len {total_len} exceeds block_size {}",
-            config.block_size
-        );
+        let mut callback_count = 0usize;
+        let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {
+            callback_count += 1;
+        });
+        assert_eq!(output.dims(), [1, prompt_len + max_new]);
+        assert_eq!(callback_count, max_new);
     }
 
     #[test]
@@ -417,8 +481,7 @@ mod tests {
         let context = prompt.clone().slice([0..1, 0..prompt_len - 1]);
         let (_, cache) = gpt.forward_cached(context, None);
 
-        let (cached_k, _) = &cache.layers[0];
-        let [_, cached_heads, _, _] = cached_k.dims();
+        let [_, cached_heads, _, _] = cache.layers[0].k.dims();
         assert_eq!(cached_heads, 2, "KV cache should store n_kv_head heads");
 
         let last_token = prompt.clone().slice([0..1, prompt_len - 1..prompt_len]);
@@ -485,27 +548,27 @@ mod tests {
     }
 
     #[test]
-    fn generate_callback_matches_generated_count_at_block_size() {
+    fn generate_callback_matches_generated_count_past_block_size() {
         let device = test_device();
         let config = create_test_config();
         let gpt = GPT::new(&config, &device);
 
         let prompt_len = 14;
-        let max_new = 10;
+        let max_new = 25; // crosses block_size=16 multiple times (multiple slides)
         let prompt = Tensor::<2, Int>::zeros([1, prompt_len], &device);
         let sampling = SamplingParams {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
-            repetition_penalty: 1.0,
+            repetition_penalty: 1.1,
         };
 
         let mut callback_count = 0usize;
         let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {
             callback_count += 1;
         });
-        assert_eq!(output.dims(), [1, config.block_size]);
-        assert_eq!(callback_count, config.block_size - prompt_len);
+        assert_eq!(output.dims(), [1, prompt_len + max_new]);
+        assert_eq!(callback_count, max_new);
     }
 
     #[test]
@@ -523,7 +586,7 @@ mod tests {
         };
 
         let output = gpt.generate(prompt, 5, &sampling, config.block_size, |_| {});
-        assert_eq!(output.dims(), [1, config.block_size]);
+        assert_eq!(output.dims(), [1, config.block_size + 5]);
     }
 
     #[test]

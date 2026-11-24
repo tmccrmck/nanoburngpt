@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::{
-    data::{BpeTokenizer, TextGenerationBatch, TextGenerationBatcher, load_text},
+    data::{BpeTokenizer, TextGenerationBatch, TextGenerationBatcher},
     datasets::Dataset,
     model::{GPT, GPTConfig},
 };
@@ -522,8 +522,7 @@ pub fn run_training(
     };
 
     // --- Data ---
-    let data_path = dataset.ensure_downloaded()?;
-    let (train_dataset, val_dataset) = load_text(&data_path, gpt_config.block_size)?;
+    let (train_dataset, val_dataset) = dataset.load(gpt_config.block_size)?;
 
     // Optionally cap train/validation sets
     let train_dataset = if training_config.max_train_items > 0 {

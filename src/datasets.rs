@@ -1,7 +1,8 @@
+use crate::data::{TextDataset, load_text, load_text_file};
 use std::{
     fmt, fs,
     io::{Cursor, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 const SHAKESPEARE_URL: &str =
@@ -40,18 +41,27 @@ impl std::str::FromStr for Dataset {
 }
 
 impl Dataset {
-    /// Path where the preprocessed plain-text file is cached locally.
+    /// Path where the preprocessed training plain-text file is cached locally.
     pub fn local_path(&self) -> PathBuf {
         match self {
             Self::Shakespeare => PathBuf::from("data/shakespeare/input.txt"),
-            Self::WikiText103 => PathBuf::from("data/wikitext103/input.txt"),
+            Self::WikiText103 => PathBuf::from("data/wikitext103/train.txt"),
         }
     }
 
-    /// Ensure the dataset is downloaded and preprocessed. Returns the local path.
+    /// Optional canonical validation split path (WikiText-103 has `wiki.valid.raw`).
+    pub fn valid_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Shakespeare => None,
+            Self::WikiText103 => Some(PathBuf::from("data/wikitext103/valid.txt")),
+        }
+    }
+
+    /// Ensure the dataset is downloaded and preprocessed. Returns the local train path.
     pub fn ensure_downloaded(&self) -> anyhow::Result<PathBuf> {
         let path = self.local_path();
-        if path.exists() {
+        let valid_ready = self.valid_path().as_ref().is_none_or(|p| p.exists());
+        if path.exists() && valid_ready {
             return Ok(path);
         }
 
@@ -61,14 +71,29 @@ impl Dataset {
 
         match self {
             Self::Shakespeare => download_shakespeare(&path),
-            Self::WikiText103 => download_wikitext103(&path),
+            Self::WikiText103 => {
+                let valid = self.valid_path().expect("wikitext103 has valid path");
+                download_wikitext103(&path, &valid)
+            }
         }?;
 
         Ok(path)
     }
+
+    /// Download (if needed) and load `(train, val)` datasets using canonical splits when available.
+    pub fn load(&self, block_size: usize) -> anyhow::Result<(TextDataset, TextDataset)> {
+        let train_path = self.ensure_downloaded()?;
+        match self.valid_path() {
+            Some(valid_path) => Ok((
+                load_text_file(&train_path, block_size)?,
+                load_text_file(&valid_path, block_size)?,
+            )),
+            None => load_text(&train_path, block_size),
+        }
+    }
 }
 
-fn download_shakespeare(dest: &std::path::Path) -> anyhow::Result<()> {
+fn download_shakespeare(dest: &Path) -> anyhow::Result<()> {
     println!("Downloading Shakespeare from {}...", SHAKESPEARE_URL);
     let text = ureq::get(SHAKESPEARE_URL)
         .call()?
@@ -81,7 +106,33 @@ fn download_shakespeare(dest: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn download_wikitext103(dest: &std::path::Path) -> anyhow::Result<()> {
+fn extract_zip_entry(archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str) -> anyhow::Result<String> {
+    let result: anyhow::Result<String> = {
+        match archive.by_name(name) {
+            Err(_) => Err(anyhow::anyhow!("not found")),
+            Ok(mut file) => {
+                let mut buf = String::new();
+                file.read_to_string(&mut buf)?;
+                Ok(buf)
+            }
+        }
+    };
+    match result {
+        Ok(text) => Ok(text),
+        Err(_) => {
+            let names: Vec<String> = (0..archive.len())
+                .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+                .collect();
+            anyhow::bail!(
+                "Could not find '{}' in zip. Available files: {:?}",
+                name,
+                names
+            );
+        }
+    }
+}
+
+fn download_wikitext103(train_dest: &Path, valid_dest: &Path) -> anyhow::Result<()> {
     println!("Downloading WikiText-103 from {}...", WIKITEXT103_URL);
     let bytes = ureq::get(WIKITEXT103_URL)
         .call()?
@@ -94,47 +145,16 @@ fn download_wikitext103(dest: &std::path::Path) -> anyhow::Result<()> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)?;
 
-    let target_files = [
-        "wikitext-103-raw/wiki.train.raw",
-        "wikitext-103-raw/wiki.valid.raw",
-    ];
+    let train_raw = extract_zip_entry(&mut archive, "wikitext-103-raw/wiki.train.raw")?;
+    let valid_raw = extract_zip_entry(&mut archive, "wikitext-103-raw/wiki.valid.raw")?;
 
-    let mut combined = String::new();
-    for name in &target_files {
-        // Read the file content into a local buffer, fully releasing the borrow on `archive`
-        // before we might need it again to list available entries on error.
-        let result: anyhow::Result<String> = {
-            let found = archive.by_name(name);
-            match found {
-                Err(_) => Err(anyhow::anyhow!("not found")),
-                Ok(mut file) => {
-                    let mut buf = String::new();
-                    file.read_to_string(&mut buf)?;
-                    Ok(buf)
-                }
-            }
-        };
-        match result {
-            Ok(text) => {
-                combined.push_str(&text);
-                combined.push('\n');
-            }
-            Err(_) => {
-                let names: Vec<String> = (0..archive.len())
-                    .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
-                    .collect();
-                anyhow::bail!(
-                    "Could not find '{}' in zip. Available files: {:?}",
-                    name,
-                    names
-                );
-            }
-        }
-    }
-
-    let cleaned = strip_wikitext_markup(&combined);
-    fs::write(dest, cleaned)?;
-    println!("Saved preprocessed text to {}", dest.display());
+    fs::write(train_dest, strip_wikitext_markup(&train_raw))?;
+    fs::write(valid_dest, strip_wikitext_markup(&valid_raw))?;
+    println!(
+        "Saved preprocessed train/valid splits to {} and {}",
+        train_dest.display(),
+        valid_dest.display()
+    );
     Ok(())
 }
 

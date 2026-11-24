@@ -82,12 +82,9 @@ fn bench_decode_step(c: &mut Criterion) {
 fn bench_filter_sampling(c: &mut Criterion) {
     // Build a fake probability distribution over the real vocab size
     let vocab = 50257usize;
-    let probs: Vec<f32> = (0..vocab)
-        .map(|i| (i as f32 + 1.0).recip())
-        .collect::<Vec<_>>()
-        .iter()
-        .map(|&p| p / (0..vocab).map(|i| (i as f32 + 1.0).recip()).sum::<f32>())
-        .collect();
+    let raw: Vec<f32> = (0..vocab).map(|i| (i as f32 + 1.0).recip()).collect();
+    let total: f32 = raw.iter().sum();
+    let probs: Vec<f32> = raw.into_iter().map(|p| p / total).collect();
 
     let mut group = c.benchmark_group("filter_top_k_p");
     // top-k only

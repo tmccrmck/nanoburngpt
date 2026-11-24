@@ -2,7 +2,6 @@ use burn::{
     prelude::*,
     tensor::{activation, ops::IndexingUpdateOp},
 };
-use rand::distr::{Distribution, weighted::WeightedIndex};
 
 /// Sampling parameters for text generation.
 #[derive(Clone, Debug)]
@@ -30,9 +29,42 @@ impl Default for SamplingParams {
     }
 }
 
+/// Update an incremental `[batch, vocab]` seen-token counts tensor with new tokens `[batch, seq]`.
+#[inline]
+pub(crate) fn mark_seen_tokens(
+    seen: Tensor<2>,
+    tokens: &Tensor<2, Int>,
+) -> Tensor<2> {
+    let [batch, seq_len] = tokens.dims();
+    if seq_len == 0 {
+        return seen;
+    }
+    let ones = Tensor::<2>::ones([batch, seq_len], &seen.device());
+    seen.scatter(1, tokens.clone(), ones, IndexingUpdateOp::Add)
+}
+
+/// Apply HuggingFace-style repetition penalty using a pre-accumulated `[batch, vocab]` seen counts tensor.
+#[inline]
+pub(crate) fn apply_repetition_penalty_seen(
+    logits: &Tensor<2>,
+    seen_counts: &Tensor<2>,
+    penalty: f64,
+) -> Tensor<2> {
+    if penalty <= 1.0 + 1e-6 {
+        return logits.clone();
+    }
+    let seen = seen_counts.clone().greater_elem(0.0);
+    let pos_mask = logits.clone().greater_elem(0.0);
+    let penalized = logits.clone().mask_where(pos_mask, logits.clone() / penalty);
+    let neg_mask = logits.clone().lower_elem(0.0);
+    let penalized = penalized.mask_where(neg_mask, logits.clone() * penalty);
+    logits.clone().mask_where(seen, penalized)
+}
+
 /// Apply HuggingFace-style repetition penalty to logits for tokens present in `prev_tokens`:
 /// positive logits are divided by `penalty`, negative logits are multiplied by `penalty`.
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn apply_repetition_penalty(
     logits: &Tensor<2>,
     prev_tokens: &Tensor<2, Int>,
@@ -46,67 +78,71 @@ pub(crate) fn apply_repetition_penalty(
     if seq_len == 0 {
         return logits.clone();
     }
-    let device = logits.device();
-    let ones = Tensor::<2>::ones([batch, seq_len], &device);
-    let seen = Tensor::<2>::zeros([batch, vocab], &device)
-        .scatter(1, prev_tokens.clone(), ones, IndexingUpdateOp::Add)
-        .greater_elem(0.0);
-
-    let pos_mask = logits.clone().greater_elem(0.0);
-    let penalized = logits.clone().mask_where(pos_mask, logits.clone() / penalty);
-    let neg_mask = logits.clone().lower_elem(0.0);
-    let penalized = penalized.mask_where(neg_mask, logits.clone() * penalty);
-    logits.clone().mask_where(seen, penalized)
+    let seen_counts = mark_seen_tokens(
+        Tensor::<2>::zeros([batch, vocab], &logits.device()),
+        prev_tokens,
+    );
+    apply_repetition_penalty_seen(logits, &seen_counts, penalty)
 }
 
-/// Sample next token from logits [batch, vocab], returns [batch, 1] int tensor.
-/// `prev_tokens` [batch, seq_len] contains all tokens generated so far (for repetition penalty).
+/// Sample next token from logits `[batch, vocab]` entirely on the tensor device,
+/// returning a `[batch, 1]` int tensor.
+/// `seen_counts` is an optional incremental `[batch, vocab]` seen-token tensor for O(1) repetition penalty.
 #[inline]
 pub(crate) fn sample_token(
     logits: &Tensor<2>,
     params: &SamplingParams,
-    prev_tokens: &Tensor<2, Int>,
+    seen_counts: Option<&Tensor<2>>,
 ) -> Tensor<2, Int> {
-    let [batch, vocab] = logits.dims();
-    let device = logits.device();
+    let [_, vocab] = logits.dims();
 
-    let logits = apply_repetition_penalty(logits, prev_tokens, params.repetition_penalty);
+    let logits = match seen_counts {
+        Some(seen) => apply_repetition_penalty_seen(logits, seen, params.repetition_penalty),
+        None => logits.clone(),
+    };
 
     if params.temperature < 1e-6 {
-        logits.clone().argmax(1).unsqueeze::<2>()
+        return logits.argmax(1);
+    }
+
+    let logits = logits / params.temperature;
+    let use_top_k = params.top_k > 0 && params.top_k < vocab;
+    let use_top_p = params.top_p < 1.0;
+
+    let (candidate_logits, candidate_indices) = if use_top_k {
+        let (values, indices) = logits.topk_with_indices(params.top_k, 1);
+        if use_top_p {
+            // Ensure descending order on every backend before nucleus cumsum.
+            let (sorted_vals, sub_idx) = values.sort_descending_with_indices(1);
+            let sorted_indices = indices.gather(1, sub_idx);
+            (sorted_vals, Some(sorted_indices))
+        } else {
+            (values, Some(indices))
+        }
+    } else if use_top_p {
+        let (values, indices) = logits.sort_descending_with_indices(1);
+        (values, Some(indices))
     } else {
-        let logits = logits.clone() / params.temperature;
+        (logits, None)
+    };
 
-        // Pure top-k (no top-p): fully on GPU
-        if params.top_k > 0 && params.top_p >= 1.0 && params.top_k < vocab {
-            let (values, indices) = logits.topk_with_indices(params.top_k, 1);
-            let probs = activation::softmax(values, 1);
-            let sampled = probs.categorical(1);
-            return indices.gather(1, sampled);
-        }
+    let mut probs = activation::softmax(candidate_logits, 1);
 
-        // No filtering: fully on GPU
-        if params.top_k == 0 && params.top_p >= 1.0 {
-            let probs = activation::softmax(logits, 1);
-            return probs.categorical(1);
-        }
+    if use_top_p {
+        // Keep the top-1 token (prior_cum == 0.0 < top_p) and every token up through
+        // the first token that crosses top_p.
+        let cumprobs = probs.clone().cumsum(1);
+        let prior_cum = cumprobs - probs.clone();
+        let exclude = prior_cum.greater_equal_elem(params.top_p);
+        probs = probs.mask_fill(exclude, 0.0);
+        let sum = probs.clone().sum_dim(1).clamp_min(1e-12);
+        probs = probs / sum;
+    }
 
-        // Top-p or combined filtering: keep CPU path
-        let probs = activation::softmax(logits, 1);
-        let probs_data = probs.into_data();
-        let probs_f32 = probs_data.as_slice::<f32>().expect("f32 probs");
-
-        let mut rng = rand::rng();
-        let tokens: Vec<i32> = (0..batch)
-            .map(|b| {
-                let row = &probs_f32[b * vocab..(b + 1) * vocab];
-                let filtered = filter_top_k_p(row, params.top_k, params.top_p);
-                let dist = WeightedIndex::new(&filtered).expect("valid weights");
-                dist.sample(&mut rng) as i32
-            })
-            .collect();
-
-        Tensor::<1, Int>::from_ints(tokens.as_slice(), &device).unsqueeze::<2>()
+    let sampled = probs.categorical(1);
+    match candidate_indices {
+        Some(indices) => indices.gather(1, sampled),
+        None => sampled,
     }
 }
 
@@ -249,5 +285,30 @@ mod tests {
         let probs = vec![0.5, f32::NAN, 0.3, 0.2];
         let result = filter_top_k_p(&probs, 2, 0.9);
         assert_eq!(result.len(), probs.len());
+    }
+
+    #[test]
+    fn sample_token_on_device_top_p_and_top_k_respect_nucleus() {
+        use burn::prelude::*;
+
+        let device = Device::flex();
+        // Token 1 has overwhelming probability (> 0.999), so top_p=0.5 must always pick token 1.
+        let logits = Tensor::<2>::from_data(
+            [[0.0_f32, 20.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 20.0, 0.0]],
+            &device,
+        );
+        for (top_k, top_p) in [(0, 0.5), (3, 0.5), (2, 1.0)] {
+            let params = super::SamplingParams {
+                temperature: 1.0,
+                top_k,
+                top_p,
+                repetition_penalty: 1.0,
+            };
+            let sampled = super::sample_token(&logits, &params, None);
+            assert_eq!(sampled.dims(), [2, 1]);
+            let data = sampled.into_data();
+            let ids = data.as_slice::<i32>().unwrap();
+            assert_eq!(ids, &[1, 3], "top_k={top_k}, top_p={top_p}");
+        }
     }
 }

@@ -118,9 +118,12 @@ pub(crate) fn sample_token(
 ) -> Tensor<2, Int> {
     let [_, vocab] = logits.dims();
 
+    // Cast logits to F32 for numerically stable softmax/cumsum and to avoid
+    // Burn 0.22.1's `sort_descending_with_indices` DTypeMismatch on Flex32.
+    let logits = logits.clone().cast(burn::tensor::FloatDType::F32);
     let logits = match seen_counts {
-        Some(seen) => apply_repetition_penalty_seen(logits, seen, params.repetition_penalty),
-        None => logits.clone(),
+        Some(seen) => apply_repetition_penalty_seen(&logits, seen, params.repetition_penalty),
+        None => logits,
     };
 
     if params.temperature < 1e-6 {

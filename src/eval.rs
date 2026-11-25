@@ -116,12 +116,17 @@ pub fn run_eval(
 
     let model_path = format!("{artifact_dir}/{model_name}");
     println!("Loading model from {model_path} ...");
-    let model = GPT::new(&config, &device)
-        .try_load_file(&model_path)
+    let record = burn::store::ModuleRecord::load(&model_path)
         .map_err(|e| {
             anyhow::anyhow!(
                 "Failed to load model checkpoint '{model_path}': {e:?}. Run `cargo run -- train` first."
             )
+        })?
+        .cast_to_module_dtype();
+    let model = GPT::new(&config, &device)
+        .try_load_record(record)
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to apply model checkpoint '{model_path}': {e:?}.")
         })?;
 
     evaluate_dataset(&model, dataset, config.block_size, batch_size, &device)

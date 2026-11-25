@@ -61,11 +61,8 @@ impl RotaryCache {
             }
         }
 
-        let float_dtype = Tensor::<1>::zeros([1], device).dtype();
-        let cos = Tensor::<2>::from_data(TensorData::new(cos_vals, [max_seq_len, half]), device)
-            .cast(float_dtype);
-        let sin = Tensor::<2>::from_data(TensorData::new(sin_vals, [max_seq_len, half]), device)
-            .cast(float_dtype);
+        let cos = Tensor::<2>::from_data(TensorData::new(cos_vals, [max_seq_len, half]), device);
+        let sin = Tensor::<2>::from_data(TensorData::new(sin_vals, [max_seq_len, half]), device);
         Self { cos, sin }
     }
 

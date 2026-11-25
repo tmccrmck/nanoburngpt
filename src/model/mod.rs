@@ -784,7 +784,7 @@ mod tests {
         let out = gpt.generate_tokens(prompt, 8, &sampling, config.block_size);
         assert_eq!(out.dims(), [1, 11]);
         let data = out.into_data();
-        for &tok in data.as_slice::<i32>().unwrap() {
+        for &tok in data.try_to_vec::<i32>().unwrap().iter() {
             assert!((0..50).contains(&tok), "sampled padded token {tok} >= 50");
         }
     }

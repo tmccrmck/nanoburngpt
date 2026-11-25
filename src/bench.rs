@@ -106,10 +106,9 @@ pub fn run_bench(
         let grads = GradientsParams::from_grads(out.loss.backward(), &train_model);
         train_model = optim.step(3e-4, train_model, grads);
     }
-    let _: f32 = train_model
-        .forward_loss_chunked(train_batch.clone(), ce_chunk_size)
-        .loss
-        .into_scalar();
+    ad_device
+        .sync()
+        .map_err(|e| anyhow::anyhow!("Failed to sync device after train warmup: {e:?}"))?;
 
     let t0 = Instant::now();
     for _ in 0..timed_steps {
@@ -118,15 +117,12 @@ pub fn run_bench(
         train_model = optim.step(3e-4, train_model, grads);
     }
     // Sync final optimizer update before stopping timer
-    let _: f32 = train_model
-        .forward_loss_chunked(train_batch, ce_chunk_size)
-        .loss
-        .into_scalar();
+    ad_device
+        .sync()
+        .map_err(|e| anyhow::anyhow!("Failed to sync device after train loop: {e:?}"))?;
     let train_secs = t0.elapsed().as_secs_f64().max(1e-9);
-    // Subtract 1 eval pass amortized across timed_steps for clean train step timing
-    let train_only_secs = (train_secs - (eval_secs / timed_steps as f64)).max(1e-9);
-    let train_ms_per_step = (train_only_secs / timed_steps as f64) * 1000.0;
-    let train_tok_per_sec = (tokens_per_step * timed_steps as f64) / train_only_secs;
+    let train_ms_per_step = (train_secs / timed_steps as f64) * 1000.0;
+    let train_tok_per_sec = (tokens_per_step * timed_steps as f64) / train_secs;
 
     Ok(BenchReport {
         eval_ms_per_step,

@@ -59,9 +59,6 @@ fn bench_decode_step(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_step");
     for &prompt_len in &[8usize, 32, 64, 128] {
         let prompt = Tensor::<2, Int>::zeros([1, prompt_len], &device);
-        // Pre-warm: build the KV cache up to prompt_len so the benchmark only
-        // measures the marginal cost of decoding one more token.
-        let (_, cache) = gpt.forward_cached(prompt, None);
         let next_token = Tensor::<2, Int>::zeros([1, 1], &device);
 
         group.bench_with_input(
@@ -69,7 +66,9 @@ fn bench_decode_step(c: &mut Criterion) {
             &prompt_len,
             |b, _| {
                 b.iter_batched(
-                    || cache.clone(),
+                    // Build a fresh uniquely owned KV cache per iteration so
+                    // `slice_assign` takes the in-place fast path (`can_mut()`).
+                    || gpt.forward_cached(prompt.clone(), None).1,
                     |unique_cache| {
                         let (logits, _new_cache) =
                             gpt.forward_cached(next_token.clone(), Some(unique_cache));

@@ -23,15 +23,22 @@ pub fn generate_text(
     // 2. Tokenizer — BPE vocab is fixed, no artifact needed
     let tokenizer = BpeTokenizer::new();
 
-    // 3. Load Model (burnpack .bpk; extensionless path auto-resolves)
+    // 3. Load Model (burnpack .bpk; extensionless path auto-resolves).
+    // Cast checkpoint weights to the target device's configured `--dtype` so
+    // non-Param buffers (`RotaryCache`, `KVCache`) always match weight dtypes.
     let model_path = format!("{}/{}", artifact_dir, model_name);
     println!("Loading model from {model_path} ...");
-    let model = GPT::new(&config, &device)
-        .try_load_file(&model_path)
+    let record = burn::store::ModuleRecord::load(&model_path)
         .map_err(|e| {
             anyhow::anyhow!(
                 "Failed to load model checkpoint '{model_path}': {e:?}. Run `cargo run -- train` first."
             )
+        })?
+        .cast_to_module_dtype();
+    let model = GPT::new(&config, &device)
+        .try_load_record(record)
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to apply model checkpoint '{model_path}': {e:?}.")
         })?;
 
     // 4. Encode Prompt (prepend BOS if prompt is empty to avoid 0-length prefill)

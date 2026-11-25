@@ -161,10 +161,9 @@ pub(crate) fn sample_token(
         let prior_cum = cumprobs - probs.clone();
         let exclude = prior_cum.greater_equal_elem(top_p);
         probs = probs.mask_fill(exclude, 0.0);
-        let sum = probs.clone().sum_dim(1).clamp_min(1e-12);
-        probs = probs / sum;
     }
 
+    // Burn's `categorical` normalizes along `dim` internally.
     let sampled = probs.categorical(1);
     match candidate_indices {
         Some(indices) => indices.gather(1, sampled),

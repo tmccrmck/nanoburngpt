@@ -6,8 +6,15 @@ edition = "2024"
 [features]
 default = ["wgpu", "tui", "persistence"]
 wgpu = ["burn/wgpu"]
+# Native GPU shader backends for `wgpu` (Apple Silicon MSL / Vulkan SPIR-V)
+# instead of generic WGSL.
+metal = ["wgpu", "burn/metal"]
+vulkan = ["wgpu", "burn/vulkan"]
 cuda = ["burn/cuda", "dep:cubecl-cuda"]
 cpu = ["burn/flex"]
+# Hardware-accelerated CPU GEMM backends for `burn-flex`.
+apple-amx = ["burn/apple-amx"]
+x86-v4 = ["burn/x86-v4"]
 # Enables the interactive ratatui dashboard during training. Disabling this
 # feature (e.g. `--no-default-features --features cuda`) excludes ratatui and
 # forces Burn's plain CliMetricsRenderer in `src/train.rs`.

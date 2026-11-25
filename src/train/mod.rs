@@ -145,9 +145,18 @@ impl GPT {
         let hidden_flat = hidden.reshape([num_tokens, n_embd]);
         let targets_flat = targets.reshape([num_tokens]);
         let ce = CrossEntropyLossConfig::new().init(&hidden_flat.device());
+        // Burn 0.22.1's `log_softmax` runs directly in the logits' dtype; upcast
+        // BF16/F16 logits to F32 so `sum(exp(x - max))` over ~50k vocab never
+        // overflows F16 or suffers coarse BF16 quantization.
+        let upcast_ce = |logits: Tensor<2>| match logits.dtype() {
+            burn::tensor::DType::BF16 | burn::tensor::DType::F16 => {
+                logits.cast(burn::tensor::FloatDType::F32)
+            }
+            _ => logits,
+        };
 
         if chunk_tokens == 0 || num_tokens <= chunk_tokens {
-            let logits_flat = self.project_hidden_2d(hidden_flat);
+            let logits_flat = upcast_ce(self.project_hidden_2d(hidden_flat));
             let loss = ce.forward(logits_flat, targets_flat);
             return LmLossOutput { loss, num_tokens };
         }
@@ -158,7 +167,7 @@ impl GPT {
             let end = (start + chunk_tokens).min(num_tokens);
             let len = end - start;
             let h_chunk = hidden_flat.clone().slice([start..end, 0..n_embd]);
-            let logits_chunk = self.project_hidden_2d(h_chunk);
+            let logits_chunk = upcast_ce(self.project_hidden_2d(h_chunk));
             let t_chunk = targets_flat.clone().slice(start..end);
             let weighted = ce.forward(logits_chunk, t_chunk) * (len as f64 / num_tokens as f64);
             total_loss = Some(match total_loss {
@@ -255,7 +264,10 @@ pub(crate) fn build_optimizer(choice: OptimizerChoice) -> ModuleOptimizer {
     match choice {
         OptimizerChoice::AdamW => base_optim,
         OptimizerChoice::Muon => {
-            let hidden_2d_group = ParamGroup::from_any_predicates(vec!["c_attn", "c_proj", "c_fc"]);
+            // Match only `.weight` so Muon (which requires 2D tensors) never
+            // picks up 1D bias parameters if biases are ever enabled.
+            let hidden_2d_group =
+                ParamGroup::from_any_predicates(vec!["c_attn.weight", "c_proj.weight", "c_fc.weight"]);
             let muon = MuonConfig::new()
                 .with_adjust_lr_fn(AdjustLrFn::MatchRmsAdamW)
                 .with_weight_decay(Some(WeightDecayConfig::new(0.1)))

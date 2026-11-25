@@ -16,11 +16,13 @@ BRANCH = "main"
 MODEL = "gpt2-small"
 DATASET = "shakespeare"
 OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
-DTYPE = "f32"  # f32 on 1x T4 avoids Burn 0.22.1 Flex32 FlashAttn valid bug & 2x T4 NCCL hangs
-MULTI_GPU = "off"  # single T4 (100% reliable; directly benchmarks Shared RoPE + 50304 vocab vs v2)
+DTYPE = "f32"  # f32 on 2x T4 DDP (deadlock-free via ScalarLossOutput)
+MULTI_GPU = "ddp"  # 2x T4 NCCL DDP (with NCCL_P2P_DISABLE=1)
 GRAD_CHECKPOINTING = False
+QK_NORM = False
+LOGIT_SOFTCAP = 0.0  # 0.0 = disabled (e.g. 15.0 for nanochat/Gemma-2 style)
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 4  # 1x T4 x batch 8 x accum 4 = effective batch 32 sequences (matches v2 baseline)
+GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences (matches v2/v9)
 BLOCK_SIZE = 256  # 0 = use preset default
 NUM_EPOCHS = 10
 LEARNING_RATE = 3e-4
@@ -125,7 +127,7 @@ def main() -> None:
 
         banner("Building NanoBurnGPT (CUDA)")
         build_env = os.environ.copy()
-        build_env["CARGO_PROFILE_RELEASE_LTO"] = "off"
+        build_env["CARGO_PROFILE_RELEASE_LTO"] = "thin"
         build_env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] = "16"
 
         t0 = time.monotonic()
@@ -157,6 +159,10 @@ def main() -> None:
     ]
     if GRAD_CHECKPOINTING:
         train_cmd.append("--grad-checkpointing")
+    if QK_NORM:
+        train_cmd.append("--qk-norm")
+    if LOGIT_SOFTCAP > 0.0:
+        train_cmd += ["--logit-softcap", str(LOGIT_SOFTCAP)]
     if BLOCK_SIZE > 0:
         train_cmd += ["--block-size", str(BLOCK_SIZE)]
     if MAX_TRAIN_ITEMS > 0:

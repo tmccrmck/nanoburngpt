@@ -2,7 +2,7 @@ pub mod metrics;
 pub mod renderer;
 pub mod scheduler;
 
-pub use self::metrics::{LmLossOutput, LossPerplexityInput, LossPerplexityMetric};
+pub use self::metrics::{LmLossOutput, LossPerplexityMetric, ScalarLossMetric, ScalarLossOutput};
 pub use self::renderer::CompactCliRenderer;
 pub use self::scheduler::WarmupCosineScheduler;
 
@@ -29,10 +29,7 @@ use burn::{
         checkpoint::{
             ComposedCheckpointingStrategy, KeepLastNCheckpoints, MetricCheckpointingStrategy,
         },
-        metric::{
-            LossMetric,
-            store::{Aggregate, Direction, Split},
-        },
+        metric::store::{Aggregate, Direction, Split},
     },
 };
 
@@ -148,26 +145,39 @@ impl GPT {
 
 impl TrainStep for GPT {
     type Input = TextGenerationBatch;
-    type Output = LmLossOutput;
+    type Output = ScalarLossOutput;
 
-    fn step(&self, item: TextGenerationBatch) -> TrainOutput<LmLossOutput> {
+    fn step(&self, item: TextGenerationBatch) -> TrainOutput<ScalarLossOutput> {
         let loss_scale = item.loss_scale;
         let out = self.forward_loss(item);
         let grads = if (loss_scale - 1.0).abs() > 1e-9 {
             (out.loss.clone() * loss_scale).backward()
         } else {
-            out.loss.backward()
+            out.loss.clone().backward()
         };
-        TrainOutput::new(self, grads, out)
+        let loss = out.loss.try_into_scalar::<f64>().unwrap_or(f64::NAN);
+        TrainOutput::new(
+            self,
+            grads,
+            ScalarLossOutput {
+                loss,
+                num_tokens: out.num_tokens,
+            },
+        )
     }
 }
 
 impl InferenceStep for GPT {
     type Input = TextGenerationBatch;
-    type Output = LmLossOutput;
+    type Output = ScalarLossOutput;
 
-    fn step(&self, item: TextGenerationBatch) -> LmLossOutput {
-        self.forward_loss(item)
+    fn step(&self, item: TextGenerationBatch) -> ScalarLossOutput {
+        let out = self.forward_loss(item);
+        let loss = out.loss.try_into_scalar::<f64>().unwrap_or(f64::NAN);
+        ScalarLossOutput {
+            loss,
+            num_tokens: out.num_tokens,
+        }
     }
 }
 
@@ -421,8 +431,8 @@ pub fn run_training_with_datasets(
     };
 
     let mut training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_val)
-        .metric_train_numeric(LossMetric::new())
-        .metric_valid_numeric(LossMetric::new())
+        .metric_train_numeric(ScalarLossMetric::new())
+        .metric_valid_numeric(ScalarLossMetric::new())
         .metric_train_numeric(LossPerplexityMetric::new())
         .metric_valid_numeric(LossPerplexityMetric::new())
         .with_default_checkpointers()

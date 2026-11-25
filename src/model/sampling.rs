@@ -78,9 +78,8 @@ pub(crate) fn apply_repetition_penalty_seen(
     }
     let seen = seen_counts.clone().greater_elem(0.0);
     let pos_mask = logits.clone().greater_elem(0.0);
-    let penalized = logits.clone().mask_where(pos_mask, logits.clone() / penalty);
-    let neg_mask = logits.clone().lower_elem(0.0);
-    let penalized = penalized.mask_where(neg_mask, logits.clone() * penalty);
+    // 0.0 * penalty == 0.0, so a single mask_where handles both positive and negative logits.
+    let penalized = (logits.clone() * penalty).mask_where(pos_mask, logits.clone() / penalty);
     logits.clone().mask_where(seen, penalized)
 }
 

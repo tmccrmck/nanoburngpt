@@ -9,10 +9,9 @@ use burn::{
         RmsNorm, RmsNormConfig,
     },
     prelude::*,
-    tensor::activation,
 };
 
-pub use self::attention::{CausalSelfAttention, KVCache, LayerKV, RotaryCache};
+pub use self::attention::{CausalSelfAttention, KVCache, LayerKV, RotaryCache, RotarySlice};
 use self::sampling::{mark_seen_tokens, sample_token};
 pub use self::sampling::filter_top_k_p;
 pub use self::sampling::SamplingParams;
@@ -120,7 +119,9 @@ impl MLP {
     #[inline]
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.c_fc.forward(x);
-        let x = activation::relu(x).square();
+        // `clamp_min(0.0).square()` fuses into a single CubeCL kernel (unlike `relu`,
+        // which falls back to `lower_equal_elem + mask_fill` with a bool mask).
+        let x = x.clamp_min(0.0).square();
         let x = self.c_proj.forward(x);
         self.dropout.forward(x)
     }
@@ -145,8 +146,13 @@ impl Block {
     }
 
     #[inline]
-    pub fn forward(&self, x: Tensor<3>, rope: &RotaryCache) -> Tensor<3> {
-        let x = x.clone() + self.attn.forward(self.ln_1.forward(x), rope);
+    pub fn forward(
+        &self,
+        x: Tensor<3>,
+        rope: &RotarySlice,
+        causal_mask: Option<&Tensor<4, Bool>>,
+    ) -> Tensor<3> {
+        let x = x.clone() + self.attn.forward(self.ln_1.forward(x), rope, causal_mask);
         x.clone() + self.mlp.forward(self.ln_2.forward(x))
     }
 
@@ -154,7 +160,7 @@ impl Block {
     pub fn forward_cached(
         &self,
         x: Tensor<3>,
-        rope: &RotaryCache,
+        rope: &RotarySlice,
         cache: Option<LayerKV>,
         pos_offset: usize,
         max_len: usize,
@@ -172,6 +178,7 @@ impl Block {
 pub struct GPT {
     token_embedding: Embedding,
     rope: RotaryCache,
+    causal_mask: Tensor<4, Bool>,
     blocks: Vec<Block>,
     ln_f: RmsNorm,
     logit_softcap: f64,
@@ -189,6 +196,17 @@ impl GPT {
         let head_dim = config.n_embd / config.n_head;
         let rope = RotaryCache::new(config.block_size, head_dim, config.rope_theta, device);
 
+        // Precompute strictly upper-triangular causal mask `[1, 1, block_size, block_size]`
+        // once so autodiff training avoids rebuilding the mask on every layer (72 kernels/step).
+        let n = config.block_size;
+        let mut mask_vals = vec![false; n * n];
+        for r in 0..n {
+            for c in (r + 1)..n {
+                mask_vals[r * n + c] = true;
+            }
+        }
+        let causal_mask = Tensor::<4, Bool>::from_bool(TensorData::new(mask_vals, [1, 1, n, n]), device);
+
         let blocks = (0..config.n_layer)
             .map(|_| Block::new(config, device))
             .collect();
@@ -198,6 +216,7 @@ impl GPT {
         Self {
             token_embedding,
             rope,
+            causal_mask,
             blocks,
             ln_f,
             logit_softcap: config.logit_softcap,
@@ -224,10 +243,19 @@ impl GPT {
 
     #[inline]
     pub fn forward(&self, idx: Tensor<2, Int>) -> Tensor<3> {
+        let [_, seq_len] = idx.dims();
         let mut x = self.token_embedding.forward(idx);
+        let rope = self.rope.slice(0, seq_len);
+
+        // Pass precomputed mask under autodiff (which always uses attention_fallback);
+        // keep `None` + `is_causal: true` for inference so FlashAttention uses its native path.
+        let causal_mask = x
+            .device()
+            .is_autodiff()
+            .then(|| self.causal_mask.clone().slice([0..1, 0..1, 0..seq_len, 0..seq_len]));
 
         for block in &self.blocks {
-            x = block.forward(x, &self.rope);
+            x = block.forward(x, &rope, causal_mask.as_ref());
         }
 
         self.project_lm_head(x)
@@ -260,6 +288,7 @@ impl GPT {
         let pos_offset = cache.as_ref().map_or(0, KVCache::len);
 
         let mut x = self.token_embedding.forward(idx);
+        let rope = self.rope.slice(pos_offset, seq_len);
 
         // Move ownership of layer caches so `slice_assign` stays in-place (refcount == 1).
         let mut prev_layers = cache.map(|c| c.layers.into_iter());
@@ -267,7 +296,7 @@ impl GPT {
         for block in &self.blocks {
             let layer_cache = prev_layers.as_mut().and_then(Iterator::next);
             let (out, layer_kv) =
-                block.forward_cached(x, &self.rope, layer_cache, pos_offset, max_len);
+                block.forward_cached(x, &rope, layer_cache, pos_offset, max_len);
             x = out;
             new_layers.push(layer_kv);
         }

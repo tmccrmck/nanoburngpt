@@ -16,6 +16,29 @@ pub struct RotaryCache {
     sin: Tensor<2>,
 }
 
+/// Pre-sliced `(cos, sin)` tensors of shape `[1, 1, seq_len, head_dim / 2]`
+/// hoisted once per forward pass and reused across all transformer blocks.
+pub struct RotarySlice {
+    cos: Tensor<4>,
+    sin: Tensor<4>,
+}
+
+impl RotarySlice {
+    /// Apply pre-sliced RoPE to `x` of shape `[batch, n_head, seq_len, head_dim]`.
+    #[inline]
+    pub fn apply(&self, x: Tensor<4>) -> Tensor<4> {
+        let [batch, n_head, seq_len, head_dim] = x.dims();
+        let half = head_dim / 2;
+
+        let x1 = x.clone().slice([0..batch, 0..n_head, 0..seq_len, 0..half]);
+        let x2 = x.slice([0..batch, 0..n_head, 0..seq_len, half..head_dim]);
+
+        let y1 = x1.clone() * self.cos.clone() - x2.clone() * self.sin.clone();
+        let y2 = x1 * self.sin.clone() + x2 * self.cos.clone();
+        Tensor::cat(vec![y1, y2], 3)
+    }
+}
+
 impl RotaryCache {
     pub fn new(max_seq_len: usize, head_dim: usize, theta: f64, device: &Device) -> Self {
         assert!(
@@ -43,13 +66,11 @@ impl RotaryCache {
         Self { cos, sin }
     }
 
-    /// Apply RoPE to `x` of shape `[batch, n_head, seq_len, head_dim]` starting at `pos_offset`.
+    /// Slice `(cos, sin)` once for `[pos_offset..pos_offset + seq_len]` to share across all layers.
     #[inline]
-    pub fn apply(&self, x: Tensor<4>, pos_offset: usize) -> Tensor<4> {
-        let [batch, n_head, seq_len, head_dim] = x.dims();
-        let half = head_dim / 2;
+    pub fn slice(&self, pos_offset: usize, seq_len: usize) -> RotarySlice {
+        let half = self.cos.dims()[1];
         let end = pos_offset + seq_len;
-
         let cos = self
             .cos
             .clone()
@@ -60,13 +81,14 @@ impl RotaryCache {
             .clone()
             .slice([pos_offset..end, 0..half])
             .reshape([1, 1, seq_len, half]);
+        RotarySlice { cos, sin }
+    }
 
-        let x1 = x.clone().slice([0..batch, 0..n_head, 0..seq_len, 0..half]);
-        let x2 = x.slice([0..batch, 0..n_head, 0..seq_len, half..head_dim]);
-
-        let y1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
-        let y2 = x1 * sin + x2 * cos;
-        Tensor::cat(vec![y1, y2], 3)
+    /// Convenience helper for single-layer callers/tests.
+    #[inline]
+    pub fn apply(&self, x: Tensor<4>, pos_offset: usize) -> Tensor<4> {
+        let seq_len = x.dims()[2];
+        self.slice(pos_offset, seq_len).apply(x)
     }
 }
 
@@ -159,28 +181,30 @@ impl CausalSelfAttention {
     fn split_qkv(&self, x: Tensor<3>) -> (Tensor<4>, Tensor<4>, Tensor<4>, usize, usize, usize) {
         let [batch_size, seq_len, _] = x.dims();
         let head_dim = self.n_embd / self.n_head;
-        let q_dim = self.n_head * head_dim;
-        let kv_dim = self.n_kv_head * head_dim;
+        let total_heads = self.n_head + 2 * self.n_kv_head;
 
-        let qkv = self.c_attn.forward(x);
+        // Reshape the contiguous projection BEFORE slicing so Q, K, V are zero-copy views
+        // (avoids 3 full-tensor copy_into allocations per layer in forward and backward).
+        let qkv = self
+            .c_attn
+            .forward(x)
+            .reshape([batch_size, seq_len, total_heads, head_dim])
+            .permute([0, 2, 1, 3]);
         let q = qkv
             .clone()
-            .slice([0..batch_size, 0..seq_len, 0..q_dim])
-            .reshape([batch_size, seq_len, self.n_head, head_dim])
-            .permute([0, 2, 1, 3]);
-        let k = qkv
-            .clone()
-            .slice([0..batch_size, 0..seq_len, q_dim..(q_dim + kv_dim)])
-            .reshape([batch_size, seq_len, self.n_kv_head, head_dim])
-            .permute([0, 2, 1, 3]);
-        let v = qkv
-            .slice([
-                0..batch_size,
-                0..seq_len,
-                (q_dim + kv_dim)..(q_dim + 2 * kv_dim),
-            ])
-            .reshape([batch_size, seq_len, self.n_kv_head, head_dim])
-            .permute([0, 2, 1, 3]);
+            .slice([0..batch_size, 0..self.n_head, 0..seq_len, 0..head_dim]);
+        let k = qkv.clone().slice([
+            0..batch_size,
+            self.n_head..(self.n_head + self.n_kv_head),
+            0..seq_len,
+            0..head_dim,
+        ]);
+        let v = qkv.slice([
+            0..batch_size,
+            (self.n_head + self.n_kv_head)..total_heads,
+            0..seq_len,
+            0..head_dim,
+        ]);
 
         (q, k, v, batch_size, seq_len, head_dim)
     }
@@ -199,11 +223,16 @@ impl CausalSelfAttention {
     }
 
     #[inline]
-    pub fn forward(&self, x: Tensor<3>, rope: &RotaryCache) -> Tensor<3> {
+    pub fn forward(
+        &self,
+        x: Tensor<3>,
+        rope: &RotarySlice,
+        causal_mask: Option<&Tensor<4, Bool>>,
+    ) -> Tensor<3> {
         let (q, k, v, batch_size, seq_len, _) = self.split_qkv(x);
 
-        let q = rope.apply(q, 0);
-        let k = rope.apply(k, 0);
+        let q = rope.apply(q);
+        let k = rope.apply(k);
         let (q, k) = self.apply_qk_norm(q, k);
 
         let (k, v) = if self.n_kv_head < self.n_head {
@@ -213,14 +242,22 @@ impl CausalSelfAttention {
             (k, v)
         };
 
+        let (mask, is_causal) = match causal_mask {
+            Some(m) => (
+                Some(m.clone().expand([batch_size, self.n_head, seq_len, seq_len])),
+                false,
+            ),
+            None => (None, true),
+        };
+
         let y = attention(
             q,
             k,
             v,
-            None,
+            mask,
             None,
             AttentionModuleOptions {
-                is_causal: true,
+                is_causal,
                 ..Default::default()
             },
         );
@@ -236,15 +273,15 @@ impl CausalSelfAttention {
     pub fn forward_cached(
         &self,
         x: Tensor<3>,
-        rope: &RotaryCache,
+        rope: &RotarySlice,
         cache: Option<LayerKV>,
         pos_offset: usize,
         max_len: usize,
     ) -> (Tensor<3>, LayerKV) {
-        let (q, mut k, v, batch_size, seq_len, head_dim) = self.split_qkv(x);
+        let (q, k, v, batch_size, seq_len, head_dim) = self.split_qkv(x);
 
-        let q = rope.apply(q, pos_offset);
-        k = rope.apply(k, pos_offset);
+        let q = rope.apply(q);
+        let k = rope.apply(k);
         let (q, k) = self.apply_qk_norm(q, k);
 
         let new_len = pos_offset + seq_len;
@@ -393,7 +430,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let y = attn.forward(x, &rope);
+        let y = attn.forward(x, &rope.slice(0, seq), None);
 
         assert_eq!(y.dims(), [batch, seq, config.n_embd]);
     }
@@ -412,7 +449,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let y = attn.forward(x, &rope);
+        let y = attn.forward(x, &rope.slice(0, seq), None);
 
         assert_eq!(y.dims(), [batch, seq, config.n_embd]);
     }
@@ -432,14 +469,26 @@ mod tests {
             &device,
         );
 
-        let expected = attn.forward(x.clone(), &rope);
+        let expected = attn.forward(x.clone(), &rope.slice(0, seq), None);
         let expected_last = expected.slice([0..1, seq - 1..seq, 0..config.n_embd]);
 
         let prefix = x.clone().slice([0..1, 0..seq - 1, 0..config.n_embd]);
-        let (_, cache) = attn.forward_cached(prefix, &rope, None, 0, config.block_size);
+        let (_, cache) = attn.forward_cached(
+            prefix,
+            &rope.slice(0, seq - 1),
+            None,
+            0,
+            config.block_size,
+        );
 
         let last = x.clone().slice([0..1, seq - 1..seq, 0..config.n_embd]);
-        let (cached, _) = attn.forward_cached(last, &rope, Some(cache), seq - 1, config.block_size);
+        let (cached, _) = attn.forward_cached(
+            last,
+            &rope.slice(seq - 1, 1),
+            Some(cache),
+            seq - 1,
+            config.block_size,
+        );
 
         let diff = (expected_last - cached).abs().sum().into_scalar::<f32>();
         assert!(
@@ -463,14 +512,26 @@ mod tests {
             &device,
         );
 
-        let expected = attn.forward(x.clone(), &rope);
+        let expected = attn.forward(x.clone(), &rope.slice(0, seq), None);
         let expected_last = expected.slice([0..1, seq - 1..seq, 0..config.n_embd]);
 
         let prefix = x.clone().slice([0..1, 0..seq - 1, 0..config.n_embd]);
-        let (_, cache) = attn.forward_cached(prefix, &rope, None, 0, config.block_size);
+        let (_, cache) = attn.forward_cached(
+            prefix,
+            &rope.slice(0, seq - 1),
+            None,
+            0,
+            config.block_size,
+        );
 
         let last = x.clone().slice([0..1, seq - 1..seq, 0..config.n_embd]);
-        let (cached, _) = attn.forward_cached(last, &rope, Some(cache), seq - 1, config.block_size);
+        let (cached, _) = attn.forward_cached(
+            last,
+            &rope.slice(seq - 1, 1),
+            Some(cache),
+            seq - 1,
+            config.block_size,
+        );
 
         let diff = (expected_last - cached).abs().sum().into_scalar::<f32>();
         assert!(
@@ -495,7 +556,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t0, &rope, None, 0, config.block_size);
+        let (_, cache) = attn.forward_cached(t0, &rope.slice(0, 1), None, 0, config.block_size);
         assert_eq!(cache.len, 1, "cache len should be 1 after first call");
         assert_eq!(
             cache.k.dims(),
@@ -508,7 +569,8 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t1, &rope, Some(cache), 1, config.block_size);
+        let (_, cache) =
+            attn.forward_cached(t1, &rope.slice(1, 1), Some(cache), 1, config.block_size);
         assert_eq!(cache.len, 2, "cache len should be 2 after second call");
         assert_eq!(
             cache.k.dims(),
@@ -533,7 +595,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t0, &rope, None, 0, config.block_size);
+        let (_, cache) = attn.forward_cached(t0, &rope.slice(0, 1), None, 0, config.block_size);
         assert_eq!(cache.len, 1);
         assert_eq!(
             cache.k.dims(),
@@ -546,7 +608,8 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t1, &rope, Some(cache), 1, config.block_size);
+        let (_, cache) =
+            attn.forward_cached(t1, &rope.slice(1, 1), Some(cache), 1, config.block_size);
         assert_eq!(cache.len, 2, "GQA cache should have len=2 after two calls");
         assert_eq!(cache.k.dims(), [1, 2, config.block_size, head_dim]);
     }

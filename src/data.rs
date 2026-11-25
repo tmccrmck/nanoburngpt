@@ -132,6 +132,11 @@ pub struct TextDatasetItem {
 
 impl TextDatasetItem {
     #[inline]
+    pub fn chunk(&self) -> &[i32] {
+        &self.data[self.start..self.start + self.len + 1]
+    }
+
+    #[inline]
     pub fn input(&self) -> &[i32] {
         &self.data[self.start..self.start + self.len]
     }
@@ -172,17 +177,17 @@ pub struct TextGenerationBatch {
 impl Batcher<TextDatasetItem, TextGenerationBatch> for TextGenerationBatcher {
     fn batch(&self, items: Vec<TextDatasetItem>, device: &Device) -> TextGenerationBatch {
         let batch_size = items.len();
-        let mut inputs_flat = Vec::<i32>::with_capacity(batch_size * self.block_size);
-        let mut targets_flat = Vec::<i32>::with_capacity(batch_size * self.block_size);
+        let stride = self.block_size + 1;
+        // Single contiguous host buffer + single H2D transfer instead of two.
+        let mut flat = Vec::<i32>::with_capacity(batch_size * stride);
         for item in &items {
-            inputs_flat.extend_from_slice(item.input());
-            targets_flat.extend_from_slice(item.target());
+            flat.extend_from_slice(item.chunk());
         }
 
-        let inputs = Tensor::<1, Int>::from_ints(inputs_flat.as_slice(), device)
-            .reshape([batch_size, self.block_size]);
-        let targets = Tensor::<1, Int>::from_ints(targets_flat.as_slice(), device)
-            .reshape([batch_size, self.block_size]);
+        let buf = Tensor::<1, Int>::from_ints(flat.as_slice(), device)
+            .reshape([batch_size, stride]);
+        let inputs = buf.clone().slice([0..batch_size, 0..self.block_size]);
+        let targets = buf.slice([0..batch_size, 1..stride]);
 
         TextGenerationBatch {
             inputs,

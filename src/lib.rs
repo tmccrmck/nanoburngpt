@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod data;
 pub mod datasets;
 pub mod eval;
@@ -5,6 +6,8 @@ pub mod inference;
 pub mod model;
 pub mod presets;
 pub mod train;
+
+pub use crate::bench::{BenchReport, run_bench};
 
 pub use crate::data::{BpeTokenizer, TextDataset};
 pub use crate::datasets::Dataset;

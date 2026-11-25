@@ -5,6 +5,7 @@ use std::{path::Path, str::FromStr};
 use burn::{config::Config, prelude::*, tensor::FloatDType};
 use clap::{Args, Parser, Subcommand};
 use nanoburngpt::{
+    bench::run_bench,
     data::load_text_file,
     datasets::Dataset,
     eval::run_eval,
@@ -165,6 +166,39 @@ enum Commands {
         /// Load best validation checkpoint (`model_best.bpk`) instead of `model_final.bpk`
         #[arg(long)]
         best: bool,
+    },
+    /// Benchmark train, eval, and KV-cache decode throughput on your local GPU (wgpu/cuda) or --cpu
+    Bench {
+        /// Model size preset (nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl)
+        #[arg(long, default_value = "gpt2-small")]
+        model: String,
+        /// Override preset: context window size
+        #[arg(long, default_value_t = 256)]
+        block_size: usize,
+        /// Batch size for eval and train steps
+        #[arg(long, default_value_t = 4)]
+        batch_size: usize,
+        /// Optimizer (adamw, muon)
+        #[arg(long, default_value = "adamw")]
+        optimizer: String,
+        /// Floating-point precision (f32, flex32, bf16, f16)
+        #[arg(long, default_value = "f32")]
+        dtype: String,
+        /// Warmup iterations before timing
+        #[arg(long, default_value_t = 3)]
+        warmup: usize,
+        /// Timed iterations for eval and train steps
+        #[arg(long, default_value_t = 10)]
+        steps: usize,
+        /// Number of tokens to generate in KV-cache decode benchmark
+        #[arg(long, default_value_t = 64)]
+        decode_tokens: usize,
+        /// Enable QK-Norm
+        #[arg(long)]
+        qk_norm: bool,
+        /// Output logit softcap (0.0 = disabled)
+        #[arg(long, default_value_t = 0.0)]
+        logit_softcap: f64,
     },
 }
 
@@ -450,6 +484,64 @@ fn main() -> anyhow::Result<()> {
                 report.total_bytes,
                 report.elapsed_secs,
                 tok_s
+            );
+        }
+        Commands::Bench {
+            model,
+            block_size,
+            batch_size,
+            optimizer,
+            dtype,
+            warmup,
+            steps,
+            decode_tokens,
+            qk_norm,
+            logit_softcap,
+        } => {
+            let preset = model.parse::<ModelPreset>()?;
+            let mut gpt_config = preset.config();
+            gpt_config.block_size = block_size;
+            gpt_config.qk_norm = qk_norm;
+            gpt_config.logit_softcap = logit_softcap;
+            gpt_config.validate()?;
+
+            let optimizer_choice = OptimizerChoice::from_str(&optimizer)?;
+            let mut device = select_device(cpu);
+            let float_dtype = parse_float_dtype(&dtype)?;
+            if float_dtype != FloatDType::F32 {
+                device.configure(float_dtype).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to configure dtype {:?} on {:?}: {:?}",
+                        float_dtype,
+                        device,
+                        e
+                    )
+                })?;
+            }
+
+            println!(
+                "Benchmarking {model} (ctx={block_size}, batch={batch_size}, opt={optimizer_choice:?}, dtype={float_dtype:?}) on {device:?} ..."
+            );
+            let report = run_bench(
+                device,
+                &gpt_config,
+                optimizer_choice,
+                batch_size,
+                warmup,
+                steps,
+                decode_tokens,
+            )?;
+            println!(
+                "  Eval   : {:>7.1} ms/step  ({:>8.0} tok/s)",
+                report.eval_ms_per_step, report.eval_tok_per_sec
+            );
+            println!(
+                "  Train  : {:>7.1} ms/step  ({:>8.0} tok/s)",
+                report.train_ms_per_step, report.train_tok_per_sec
+            );
+            println!(
+                "  Decode : {:>7.1} ms/tok   ({:>8.1} tok/s, {decode_tokens} tokens)",
+                report.decode_ms_per_tok, report.decode_tok_per_sec
             );
         }
     }

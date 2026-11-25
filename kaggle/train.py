@@ -16,13 +16,13 @@ BRANCH = "main"
 MODEL = "gpt2-small"
 DATASET = "shakespeare"
 OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
-DTYPE = "f32"  # f32 on 2x T4 DDP (deadlock-free via ScalarLossOutput)
-MULTI_GPU = "ddp"  # 2x T4 NCCL DDP (with NCCL_P2P_DISABLE=1)
+DTYPE = "f32"  # f32 on 1x T4 (100% reliable; avoids Burn 0.22.1 Flex32 FlashAttn & DDP NCCL bugs)
+MULTI_GPU = "off"  # single T4 (Burn 0.22.1 DdpWorker/DistributedSyncServer has upstream NCCL deadlock)
 GRAD_CHECKPOINTING = False
 QK_NORM = False
 LOGIT_SOFTCAP = 0.0  # 0.0 = disabled (e.g. 15.0 for nanochat/Gemma-2 style)
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences (matches v2/v9)
+GRAD_ACCUM_STEPS = 4  # 1x T4 x batch 8 x accum 4 = effective batch 32 sequences (matches v2/v9)
 BLOCK_SIZE = 256  # 0 = use preset default
 NUM_EPOCHS = 10
 LEARNING_RATE = 3e-4
@@ -127,7 +127,7 @@ def main() -> None:
 
         banner("Building NanoBurnGPT (CUDA)")
         build_env = os.environ.copy()
-        build_env["CARGO_PROFILE_RELEASE_LTO"] = "thin"
+        build_env["CARGO_PROFILE_RELEASE_LTO"] = "off"
         build_env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] = "16"
 
         t0 = time.monotonic()

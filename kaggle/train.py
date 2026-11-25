@@ -14,28 +14,26 @@ REPO_URL = "https://github.com/tmccrmck/nanoburngpt.git"
 BRANCH = "main"
 
 MODEL = "gpt2-small"
-DATASET = "shakespeare"
-OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
-DTYPE = "f32"  # f32 on 2x T4 DDP (with cubecl.toml async CUDA allocator)
-MULTI_GPU = "ddp"  # 2x T4 NCCL DDP with NCCL_P2P_DISABLE=1 + cubecl.toml async allocator
+DATASET = "wikitext103"
+OPTIMIZER = "muon"  # Muon for 2D block weights + AdamW for embeddings/norms
+DTYPE = "f32"  # f32 on 1x T4 (100% reliable)
+MULTI_GPU = "off"  # single T4 (avoids Burn 0.22.1 DDP race tracked in tracel-ai/burn#6621)
 GRAD_CHECKPOINTING = False
-QK_NORM = False
-LOGIT_SOFTCAP = 0.0  # 0.0 = disabled (e.g. 15.0 for nanochat/Gemma-2 style)
+QK_NORM = True
+LOGIT_SOFTCAP = 15.0  # nanochat / Gemma-2 style output softcap
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences (matches v2/v9/v11)
+GRAD_ACCUM_STEPS = 4  # 1x T4 x batch 8 x accum 4 = effective batch 32 (amortizes Muon NS 4x)
 BLOCK_SIZE = 256  # 0 = use preset default
-NUM_EPOCHS = 10
-LEARNING_RATE = 3e-4
-WARMUP_ITERS = 30
+NUM_EPOCHS = 1
+LEARNING_RATE = 6e-4
+WARMUP_ITERS = 60
 NUM_WORKERS = 2
-# Safety timeout (seconds) on the training subprocess so an upstream NCCL hang exits
-# cleanly instead of idling in Kaggle Active Events and burning GPU quota.
-TRAIN_TIMEOUT_SECS = 1500
-# 0 = full dataset (e.g. set MAX_TRAIN_ITEMS = 128, MODEL = "nano",
-# NUM_EPOCHS = 1 for a quick end-to-end smoke test).
-MAX_TRAIN_ITEMS = 0
+# Safety timeout (seconds) on the training subprocess.
+TRAIN_TIMEOUT_SECS = 7200
+# 40,000 chunks x 256 tokens ~= 10.24M unique WikiText-103 tokens (~60 min on 1x T4).
+MAX_TRAIN_ITEMS = 40000
 
-GENERATE_PROMPT = "HAMLET:\n"
+GENERATE_PROMPT = "The history of the Roman Empire"
 GENERATE_TOKENS = 200
 REPETITION_PENALTY = 1.1
 GENERATE_DTYPE = "f32"

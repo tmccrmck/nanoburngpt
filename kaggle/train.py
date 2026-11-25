@@ -16,18 +16,21 @@ BRANCH = "main"
 MODEL = "gpt2-small"
 DATASET = "shakespeare"
 OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
-DTYPE = "f32"  # f32 on 1x T4 (100% reliable; avoids Burn 0.22.1 Flex32 FlashAttn & DDP NCCL bugs)
-MULTI_GPU = "off"  # single T4 (Burn 0.22.1 DdpWorker/DistributedSyncServer has upstream NCCL deadlock)
+DTYPE = "f32"  # f32 on 2x T4 DDP (with cubecl.toml async CUDA allocator)
+MULTI_GPU = "ddp"  # 2x T4 NCCL DDP with NCCL_P2P_DISABLE=1 + cubecl.toml async allocator
 GRAD_CHECKPOINTING = False
 QK_NORM = False
 LOGIT_SOFTCAP = 0.0  # 0.0 = disabled (e.g. 15.0 for nanochat/Gemma-2 style)
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 4  # 1x T4 x batch 8 x accum 4 = effective batch 32 sequences (matches v2/v9)
+GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences (matches v2/v9/v11)
 BLOCK_SIZE = 256  # 0 = use preset default
 NUM_EPOCHS = 10
 LEARNING_RATE = 3e-4
 WARMUP_ITERS = 30
 NUM_WORKERS = 2
+# Safety timeout (seconds) on the training subprocess so an upstream NCCL hang exits
+# cleanly instead of idling in Kaggle Active Events and burning GPU quota.
+TRAIN_TIMEOUT_SECS = 1500
 # 0 = full dataset (e.g. set MAX_TRAIN_ITEMS = 128, MODEL = "nano",
 # NUM_EPOCHS = 1 for a quick end-to-end smoke test).
 MAX_TRAIN_ITEMS = 0
@@ -48,9 +51,14 @@ def banner(msg: str) -> None:
     print(f"\n=== {msg} ===", flush=True)
 
 
-def run(cmd: list[str], env: dict[str, str] | None = None, check: bool = True) -> int:
+def run(
+    cmd: list[str],
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    timeout: int | None = None,
+) -> int:
     print("+", " ".join(cmd), flush=True)
-    res = subprocess.run(cmd, env=env)
+    res = subprocess.run(cmd, env=env, timeout=timeout)
     if check and res.returncode != 0:
         raise subprocess.CalledProcessError(res.returncode, cmd)
     return res.returncode
@@ -174,7 +182,7 @@ def main() -> None:
     train_env.setdefault("NCCL_IB_DISABLE", "1")
 
     t0 = time.monotonic()
-    run(train_cmd, env=train_env)
+    run(train_cmd, env=train_env, timeout=TRAIN_TIMEOUT_SECS)
     print(f"Training completed in {time.monotonic() - t0:.1f}s", flush=True)
 
     # 5. Evaluate best checkpoint (Loss, Perplexity, BPB)

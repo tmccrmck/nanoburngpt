@@ -1,0 +1,5 @@
+# Use CUDA's stream-ordered async allocator (`cuMemAllocAsync` / `cuMemFreeAsync`)
+# instead of the default synchronous `cuMemAlloc` / `cuMemFree`, which synchronizes
+# the entire CUDA context and can deadlock against NCCL's `comm_stream` under DDP.
+[memory.cuda]
+allocator = "async"

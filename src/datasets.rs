@@ -8,8 +8,10 @@ use std::{
 const SHAKESPEARE_URL: &str =
     "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
-const WIKITEXT103_URL: &str =
-    "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip";
+const WIKITEXT103_URLS: &[&str] = &[
+    "https://huggingface.co/datasets/mattdangerw/wikitext-103-raw/resolve/main/wikitext-103-raw-v1.zip",
+    "https://huggingface.co/datasets/segyges/wikitext-103/resolve/main/wikitext-103-raw-v1.zip",
+];
 
 #[derive(Debug)]
 pub enum Dataset {
@@ -133,13 +135,34 @@ fn extract_zip_entry(archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str)
 }
 
 fn download_wikitext103(train_dest: &Path, valid_dest: &Path) -> anyhow::Result<()> {
-    println!("Downloading WikiText-103 from {}...", WIKITEXT103_URL);
-    let bytes = ureq::get(WIKITEXT103_URL)
-        .call()?
-        .body_mut()
-        .with_config()
-        .limit(512 * 1024 * 1024)
-        .read_to_vec()?;
+    let mut bytes = None;
+    let mut last_err = None;
+    for &url in WIKITEXT103_URLS {
+        println!("Downloading WikiText-103 from {url}...");
+        match ureq::get(url)
+            .call()
+            .and_then(|mut resp| {
+                resp.body_mut()
+                    .with_config()
+                    .limit(512 * 1024 * 1024)
+                    .read_to_vec()
+            }) {
+            Ok(b) => {
+                bytes = Some(b);
+                break;
+            }
+            Err(e) => {
+                eprintln!("Download failed from {url}: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    let bytes = bytes.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to download WikiText-103 from all mirrors (last error: {:?})",
+            last_err
+        )
+    })?;
     println!("Extracting zip ({} MB)...", bytes.len() / 1_000_000);
 
     let cursor = Cursor::new(bytes);

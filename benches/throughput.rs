@@ -116,6 +116,7 @@ fn bench_generate(c: &mut Criterion) {
         top_k: 0,
         top_p: 1.0,
         repetition_penalty: 1.0,
+        vocab_limit: None,
     };
 
     let mut group = c.benchmark_group("generate");

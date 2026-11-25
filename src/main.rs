@@ -345,6 +345,7 @@ fn main() -> anyhow::Result<()> {
                 top_k,
                 top_p,
                 repetition_penalty,
+                vocab_limit: None,
             };
             let model_name = if best { "model_best" } else { "model_final" };
             println!(

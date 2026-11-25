@@ -16,6 +16,9 @@ pub struct SamplingParams {
     /// (divides positive logits by `penalty`, multiplies negative logits by `penalty`,
     /// once per seen token). 1.0 = disabled.
     pub repetition_penalty: f64,
+    /// Optional upper bound on valid token IDs during sampling (e.g. `50257` when
+    /// `vocab_size` is padded to `50304` for aligned CUDA matmuls). `None` = full vocab.
+    pub vocab_limit: Option<usize>,
 }
 
 impl SamplingParams {
@@ -44,6 +47,7 @@ impl Default for SamplingParams {
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            vocab_limit: None,
         }
     }
 }
@@ -323,6 +327,7 @@ mod tests {
                 top_k,
                 top_p,
                 repetition_penalty: 1.0,
+                vocab_limit: None,
             };
             let sampled = super::sample_token(&logits, &params, None);
             assert_eq!(sampled.dims(), [2, 1]);

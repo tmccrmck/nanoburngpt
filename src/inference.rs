@@ -47,11 +47,17 @@ pub fn generate_text(
     print!("{prompt}");
     io::stdout().flush().ok();
 
+    // Never sample padded vocab slots beyond the real BPE vocabulary (50257..50304).
+    let mut sampling = sampling.clone();
+    if sampling.vocab_limit.is_none() {
+        sampling.vocab_limit = Some(BpeTokenizer::VOCAB_SIZE);
+    }
+
     let mut pending: Vec<usize> = Vec::new();
     model.generate(
         token_tensor,
         max_tokens,
-        sampling,
+        &sampling,
         config.block_size,
         |token_id| {
             pending.push(token_id as usize);

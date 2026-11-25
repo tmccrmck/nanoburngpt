@@ -1,3 +1,4 @@
+use crate::data::BpeTokenizer;
 use crate::model::GPTConfig;
 use std::str::FromStr;
 
@@ -11,13 +12,13 @@ pub enum ModelPreset {
 }
 
 impl ModelPreset {
-
     /// Return the GPTConfig for this preset.
-    /// vocab_size is always 50257 (BpeTokenizer::VOCAB_SIZE).
+    /// `vocab_size` is padded to `50304` (next multiple of 64 above `50257`) for aligned
+    /// CUDA/Tensor Core matmul tiles on the output head.
     pub fn config(&self) -> GPTConfig {
         match self {
             Self::Nano => GPTConfig {
-                vocab_size: 50257,
+                vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
                 n_layer: 2,
                 n_head: 4,
                 n_embd: 64,
@@ -27,7 +28,7 @@ impl ModelPreset {
                 rope_theta: 10000.0,
             },
             Self::Gpt2Small => GPTConfig {
-                vocab_size: 50257,
+                vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
                 n_layer: 12,
                 n_head: 12,
                 n_embd: 768,
@@ -37,7 +38,7 @@ impl ModelPreset {
                 rope_theta: 10000.0,
             },
             Self::Gpt2Medium => GPTConfig {
-                vocab_size: 50257,
+                vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
                 n_layer: 24,
                 n_head: 16,
                 n_embd: 1024,
@@ -47,7 +48,7 @@ impl ModelPreset {
                 rope_theta: 10000.0,
             },
             Self::Gpt2Large => GPTConfig {
-                vocab_size: 50257,
+                vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
                 n_layer: 36,
                 n_head: 20,
                 n_embd: 1280,
@@ -57,7 +58,7 @@ impl ModelPreset {
                 rope_theta: 10000.0,
             },
             Self::Gpt2Xl => GPTConfig {
-                vocab_size: 50257,
+                vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
                 n_layer: 48,
                 n_head: 25,
                 n_embd: 1600,
@@ -130,7 +131,8 @@ mod tests {
         assert_eq!(c.n_head, 4);
         assert_eq!(c.n_embd, 64);
         assert_eq!(c.block_size, 32);
-        assert_eq!(c.vocab_size, 50257);
+        assert_eq!(c.vocab_size, BpeTokenizer::PADDED_VOCAB_SIZE);
+        assert_eq!(c.vocab_size % 64, 0);
     }
 
     #[test]

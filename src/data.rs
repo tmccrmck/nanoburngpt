@@ -193,7 +193,10 @@ impl BpeTokenizer {
 
     /// `<|endoftext|>` — GPT-2's BOS/EOS token.
     pub const BOS_TOKEN: usize = 50256;
+    /// Exact GPT-2 / r50k_base vocabulary size.
     pub const VOCAB_SIZE: usize = 50257;
+    /// Vocabulary size padded up to the next multiple of 64 for aligned CUDA Tensor Core matmuls.
+    pub const PADDED_VOCAB_SIZE: usize = 50304;
 }
 
 // ---------------------------------------------------------------------------

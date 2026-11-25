@@ -2,13 +2,73 @@ use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 use burn::{
     module::Module,
-    nn::{
-        Dropout, DropoutConfig, Initializer, Linear, LinearConfig, RotaryEncoding,
-        RotaryEncodingConfig,
-    },
+    nn::{Dropout, DropoutConfig, Initializer, Linear, LinearConfig},
     prelude::*,
 };
 use super::GPTConfig;
+
+/// Precomputed shared Rotary Position Embedding (RoPE) cos/sin tables: `[max_seq_len, head_dim / 2]`.
+/// Stored once on `GPT` and shared across all layers, eliminating per-layer frequency table
+/// duplication and per-call CPU→GPU uploads.
+#[derive(Module, Debug)]
+pub struct RotaryCache {
+    cos: Tensor<2>,
+    sin: Tensor<2>,
+}
+
+impl RotaryCache {
+    pub fn new(max_seq_len: usize, head_dim: usize, theta: f64, device: &Device) -> Self {
+        assert!(
+            head_dim > 0 && head_dim.is_multiple_of(2),
+            "RoPE requires a positive even head_dim, got {head_dim}"
+        );
+        let half = head_dim / 2;
+        let inv_freq: Vec<f64> = (0..half)
+            .map(|i| 1.0 / theta.powf((2 * i) as f64 / head_dim as f64))
+            .collect();
+
+        let mut cos_vals = Vec::with_capacity(max_seq_len * half);
+        let mut sin_vals = Vec::with_capacity(max_seq_len * half);
+        for pos in 0..max_seq_len {
+            let p = pos as f64;
+            for &freq in &inv_freq {
+                let angle = p * freq;
+                cos_vals.push(angle.cos() as f32);
+                sin_vals.push(angle.sin() as f32);
+            }
+        }
+
+        let cos = Tensor::<2>::from_data(TensorData::new(cos_vals, [max_seq_len, half]), device);
+        let sin = Tensor::<2>::from_data(TensorData::new(sin_vals, [max_seq_len, half]), device);
+        Self { cos, sin }
+    }
+
+    /// Apply RoPE to `x` of shape `[batch, n_head, seq_len, head_dim]` starting at `pos_offset`.
+    #[inline]
+    pub fn apply(&self, x: Tensor<4>, pos_offset: usize) -> Tensor<4> {
+        let [batch, n_head, seq_len, head_dim] = x.dims();
+        let half = head_dim / 2;
+        let end = pos_offset + seq_len;
+
+        let cos = self
+            .cos
+            .clone()
+            .slice([pos_offset..end, 0..half])
+            .reshape([1, 1, seq_len, half]);
+        let sin = self
+            .sin
+            .clone()
+            .slice([pos_offset..end, 0..half])
+            .reshape([1, 1, seq_len, half]);
+
+        let x1 = x.clone().slice([0..batch, 0..n_head, 0..seq_len, 0..half]);
+        let x2 = x.slice([0..batch, 0..n_head, 0..seq_len, half..head_dim]);
+
+        let y1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
+        let y2 = x1 * sin + x2 * cos;
+        Tensor::cat(vec![y1, y2], 3)
+    }
+}
 
 /// Per-layer pre-allocated K and V cache buffers: `[batch, n_kv_head, max_len, head_dim]`.
 /// Only positions `0..len` along dimension 2 contain populated entries.
@@ -42,7 +102,6 @@ pub struct CausalSelfAttention {
     c_attn: Linear,
     c_proj: Linear,
     resid_dropout: Dropout,
-    rope: RotaryEncoding,
     n_head: usize,
     n_kv_head: usize,
     n_embd: usize,
@@ -78,9 +137,6 @@ impl CausalSelfAttention {
                 })
                 .init(device),
             resid_dropout: DropoutConfig::new(config.dropout).init(),
-            rope: RotaryEncodingConfig::new(config.block_size, head_dim)
-                .with_theta(config.rope_theta as f32)
-                .init(device),
             n_head: config.n_head,
             n_kv_head,
             n_embd: config.n_embd,
@@ -118,11 +174,11 @@ impl CausalSelfAttention {
     }
 
     #[inline]
-    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+    pub fn forward(&self, x: Tensor<3>, rope: &RotaryCache) -> Tensor<3> {
         let (q, k, v, batch_size, seq_len, _) = self.split_qkv(x);
 
-        let q = self.rope.forward(q);
-        let k = self.rope.forward(k);
+        let q = rope.apply(q, 0);
+        let k = rope.apply(k, 0);
 
         let (k, v) = if self.n_kv_head < self.n_head {
             let reps = self.n_head / self.n_kv_head;
@@ -154,14 +210,15 @@ impl CausalSelfAttention {
     pub fn forward_cached(
         &self,
         x: Tensor<3>,
+        rope: &RotaryCache,
         cache: Option<LayerKV>,
         pos_offset: usize,
         max_len: usize,
     ) -> (Tensor<3>, LayerKV) {
         let (q, mut k, v, batch_size, seq_len, head_dim) = self.split_qkv(x);
 
-        let q = self.rope.apply(q, pos_offset);
-        k = self.rope.apply(k, pos_offset);
+        let q = rope.apply(q, pos_offset);
+        k = rope.apply(k, pos_offset);
 
         let new_len = pos_offset + seq_len;
         let (mut k_buf, mut v_buf) = match cache {
@@ -282,11 +339,21 @@ mod tests {
         }
     }
 
+    fn make_rope(config: &GPTConfig, device: &Device) -> RotaryCache {
+        RotaryCache::new(
+            config.block_size,
+            config.n_embd / config.n_head,
+            config.rope_theta,
+            device,
+        )
+    }
+
     #[test]
     fn forward_returns_correct_shape() {
         let device = test_device();
         let config = test_config();
         let attn = CausalSelfAttention::new(&config, &device);
+        let rope = make_rope(&config, &device);
 
         let batch = 2;
         let seq = 8;
@@ -295,7 +362,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let y = attn.forward(x);
+        let y = attn.forward(x, &rope);
 
         assert_eq!(y.dims(), [batch, seq, config.n_embd]);
     }
@@ -305,6 +372,7 @@ mod tests {
         let device = test_device();
         let config = gqa_config();
         let attn = CausalSelfAttention::new(&config, &device);
+        let rope = make_rope(&config, &device);
 
         let batch = 2;
         let seq = 8;
@@ -313,7 +381,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let y = attn.forward(x);
+        let y = attn.forward(x, &rope);
 
         assert_eq!(y.dims(), [batch, seq, config.n_embd]);
     }
@@ -323,6 +391,7 @@ mod tests {
         let device = test_device();
         let config = test_config();
         let attn = CausalSelfAttention::new(&config, &device);
+        let rope = make_rope(&config, &device);
 
         let batch = 1;
         let seq = 8;
@@ -332,14 +401,14 @@ mod tests {
             &device,
         );
 
-        let expected = attn.forward(x.clone());
+        let expected = attn.forward(x.clone(), &rope);
         let expected_last = expected.slice([0..1, seq - 1..seq, 0..config.n_embd]);
 
         let prefix = x.clone().slice([0..1, 0..seq - 1, 0..config.n_embd]);
-        let (_, cache) = attn.forward_cached(prefix, None, 0, config.block_size);
+        let (_, cache) = attn.forward_cached(prefix, &rope, None, 0, config.block_size);
 
         let last = x.clone().slice([0..1, seq - 1..seq, 0..config.n_embd]);
-        let (cached, _) = attn.forward_cached(last, Some(cache), seq - 1, config.block_size);
+        let (cached, _) = attn.forward_cached(last, &rope, Some(cache), seq - 1, config.block_size);
 
         let diff = (expected_last - cached).abs().sum().into_scalar::<f32>();
         assert!(
@@ -353,6 +422,7 @@ mod tests {
         let device = test_device();
         let config = gqa_config();
         let attn = CausalSelfAttention::new(&config, &device);
+        let rope = make_rope(&config, &device);
 
         let batch = 1;
         let seq = 8;
@@ -362,14 +432,14 @@ mod tests {
             &device,
         );
 
-        let expected = attn.forward(x.clone());
+        let expected = attn.forward(x.clone(), &rope);
         let expected_last = expected.slice([0..1, seq - 1..seq, 0..config.n_embd]);
 
         let prefix = x.clone().slice([0..1, 0..seq - 1, 0..config.n_embd]);
-        let (_, cache) = attn.forward_cached(prefix, None, 0, config.block_size);
+        let (_, cache) = attn.forward_cached(prefix, &rope, None, 0, config.block_size);
 
         let last = x.clone().slice([0..1, seq - 1..seq, 0..config.n_embd]);
-        let (cached, _) = attn.forward_cached(last, Some(cache), seq - 1, config.block_size);
+        let (cached, _) = attn.forward_cached(last, &rope, Some(cache), seq - 1, config.block_size);
 
         let diff = (expected_last - cached).abs().sum().into_scalar::<f32>();
         assert!(
@@ -383,6 +453,7 @@ mod tests {
         let device = test_device();
         let config = test_config();
         let attn = CausalSelfAttention::new(&config, &device);
+        let rope = make_rope(&config, &device);
 
         let batch = 1;
         let n_embd = config.n_embd;
@@ -393,7 +464,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t0, None, 0, config.block_size);
+        let (_, cache) = attn.forward_cached(t0, &rope, None, 0, config.block_size);
         assert_eq!(cache.len, 1, "cache len should be 1 after first call");
         assert_eq!(
             cache.k.dims(),
@@ -406,7 +477,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t1, Some(cache), 1, config.block_size);
+        let (_, cache) = attn.forward_cached(t1, &rope, Some(cache), 1, config.block_size);
         assert_eq!(cache.len, 2, "cache len should be 2 after second call");
         assert_eq!(
             cache.k.dims(),
@@ -420,6 +491,7 @@ mod tests {
         let device = test_device();
         let config = gqa_config();
         let attn = CausalSelfAttention::new(&config, &device);
+        let rope = make_rope(&config, &device);
 
         let batch = 1;
         let n_embd = config.n_embd;
@@ -430,7 +502,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t0, None, 0, config.block_size);
+        let (_, cache) = attn.forward_cached(t0, &rope, None, 0, config.block_size);
         assert_eq!(cache.len, 1);
         assert_eq!(
             cache.k.dims(),
@@ -443,7 +515,7 @@ mod tests {
             Distribution::Normal(0.0, 1.0),
             &device,
         );
-        let (_, cache) = attn.forward_cached(t1, Some(cache), 1, config.block_size);
+        let (_, cache) = attn.forward_cached(t1, &rope, Some(cache), 1, config.block_size);
         assert_eq!(cache.len, 2, "GQA cache should have len=2 after two calls");
         assert_eq!(cache.k.dims(), [1, 2, config.block_size, head_dim]);
     }

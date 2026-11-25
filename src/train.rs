@@ -990,8 +990,8 @@ mod tests {
         let output = model.forward_loss(batch);
         let initial_loss: f32 = output.loss.into_scalar();
 
-        // 3. Train for 10 steps
-        for _ in 0..10 {
+        // 3. Train for 25 steps (deterministic convergence across random seeds)
+        for _ in 0..25 {
             let batch = batcher.batch(vec![item.clone()], &device);
             let train_output = TrainStep::step(&model, batch);
             model = optim.step(lr_scheduler.step(), model, train_output.grads);

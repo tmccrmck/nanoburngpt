@@ -12,7 +12,7 @@ use burn::{
     tensor::activation,
 };
 
-pub use self::attention::{CausalSelfAttention, KVCache, LayerKV};
+pub use self::attention::{CausalSelfAttention, KVCache, LayerKV, RotaryCache};
 use self::sampling::{mark_seen_tokens, sample_token};
 pub use self::sampling::filter_top_k_p;
 pub use self::sampling::SamplingParams;
@@ -133,8 +133,8 @@ impl Block {
     }
 
     #[inline]
-    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let x = x.clone() + self.attn.forward(self.ln_1.forward(x));
+    pub fn forward(&self, x: Tensor<3>, rope: &RotaryCache) -> Tensor<3> {
+        let x = x.clone() + self.attn.forward(self.ln_1.forward(x), rope);
         x.clone() + self.mlp.forward(self.ln_2.forward(x))
     }
 
@@ -142,13 +142,14 @@ impl Block {
     pub fn forward_cached(
         &self,
         x: Tensor<3>,
+        rope: &RotaryCache,
         cache: Option<LayerKV>,
         pos_offset: usize,
         max_len: usize,
     ) -> (Tensor<3>, LayerKV) {
         let (attn_out, new_cache) =
             self.attn
-                .forward_cached(self.ln_1.forward(x.clone()), cache, pos_offset, max_len);
+                .forward_cached(self.ln_1.forward(x.clone()), rope, cache, pos_offset, max_len);
         let x = x + attn_out;
         let x = x.clone() + self.mlp.forward(self.ln_2.forward(x));
         (x, new_cache)
@@ -158,6 +159,7 @@ impl Block {
 #[derive(Module, Debug)]
 pub struct GPT {
     token_embedding: Embedding,
+    rope: RotaryCache,
     blocks: Vec<Block>,
     ln_f: RmsNorm,
 }
@@ -171,6 +173,9 @@ impl GPT {
             })
             .init(device);
 
+        let head_dim = config.n_embd / config.n_head;
+        let rope = RotaryCache::new(config.block_size, head_dim, config.rope_theta, device);
+
         let blocks = (0..config.n_layer)
             .map(|_| Block::new(config, device))
             .collect();
@@ -179,6 +184,7 @@ impl GPT {
 
         Self {
             token_embedding,
+            rope,
             blocks,
             ln_f,
         }
@@ -200,7 +206,7 @@ impl GPT {
         let mut x = self.token_embedding.forward(idx);
 
         for block in &self.blocks {
-            x = block.forward(x);
+            x = block.forward(x, &self.rope);
         }
 
         self.project_lm_head(x)
@@ -239,7 +245,8 @@ impl GPT {
         let mut new_layers = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             let layer_cache = prev_layers.as_mut().and_then(Iterator::next);
-            let (out, layer_kv) = block.forward_cached(x, layer_cache, pos_offset, max_len);
+            let (out, layer_kv) =
+                block.forward_cached(x, &self.rope, layer_cache, pos_offset, max_len);
             x = out;
             new_layers.push(layer_kv);
         }
@@ -308,12 +315,16 @@ impl GPT {
         let (mut next_logits, mut cache) =
             self.forward_cached_internal(idx.clone(), None, block_size, true);
 
+        let full_vocab = next_logits.dims()[2];
+        let eff_vocab = sampling
+            .vocab_limit
+            .map_or(full_vocab, |limit| limit.min(full_vocab));
+
         let use_rep_penalty = sampling.repetition_penalty > 1.0 + 1e-6;
         let mut seen_counts = if use_rep_penalty {
-            let vocab = next_logits.dims()[2];
             let device = idx.device();
             Some(mark_seen_tokens(
-                Tensor::<2>::zeros([batch, vocab], &device),
+                Tensor::<2>::zeros([batch, eff_vocab], &device),
                 &idx,
             ))
         } else {
@@ -326,10 +337,10 @@ impl GPT {
         let slide_keep = (block_size / 2).clamp(1, block_size.saturating_sub(1).max(1));
 
         for step in 0..max_new_tokens {
-            let [_, len, vocab] = next_logits.dims();
+            let [_, len, _] = next_logits.dims();
             let logits = next_logits
-                .slice([0..batch, len - 1..len, 0..vocab])
-                .reshape([batch, vocab]);
+                .slice([0..batch, len - 1..len, 0..eff_vocab])
+                .reshape([batch, eff_vocab]);
 
             let idx_next = sample_token(&logits, sampling, seen_counts.as_ref());
 
@@ -461,6 +472,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            vocab_limit: None,
         };
 
         let output = gpt.generate(prompt, max_new, &sampling, config.block_size, |_| {});
@@ -482,6 +494,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            vocab_limit: None,
         };
 
         let mut callback_count = 0usize;
@@ -625,6 +638,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.1,
+            vocab_limit: None,
         };
 
         let mut callback_count = 0usize;
@@ -647,6 +661,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            vocab_limit: None,
         };
 
         let output = gpt.generate(prompt, 5, &sampling, config.block_size, |_| {});
@@ -665,9 +680,38 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            vocab_limit: None,
         };
 
         let output = gpt.generate(prompt, 4, &sampling, config.block_size, |_| {});
         assert_eq!(output.dims(), [2, 7]);
+    }
+
+    #[test]
+    fn generate_respects_vocab_limit_and_empty_prompt() {
+        let device = test_device();
+        let config = create_test_config(); // vocab_size = 100
+        let gpt = GPT::new(&config, &device);
+
+        // Empty prompt returns immediately without panicking.
+        let empty = Tensor::<2, Int>::zeros([1, 0], &device);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            vocab_limit: Some(50),
+        };
+        let out_empty = gpt.generate_tokens(empty, 5, &sampling, config.block_size);
+        assert_eq!(out_empty.dims(), [1, 0]);
+
+        // Every generated token must stay strictly below vocab_limit=50.
+        let prompt = Tensor::<2, Int>::zeros([1, 3], &device);
+        let out = gpt.generate_tokens(prompt, 8, &sampling, config.block_size);
+        assert_eq!(out.dims(), [1, 11]);
+        let data = out.into_data();
+        for &tok in data.as_slice::<i32>().unwrap() {
+            assert!((0..50).contains(&tok), "sampled padded token {tok} >= 50");
+        }
     }
 }

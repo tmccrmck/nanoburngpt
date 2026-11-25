@@ -16,11 +16,11 @@ BRANCH = "main"
 MODEL = "gpt2-small"
 DATASET = "shakespeare"
 OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
-DTYPE = "f32"  # f32 enables 2x T4 multi-GPU and avoids Burn 0.22.1 Flex32 FlashAttn valid bug on T4
-MULTI_GPU = "ddp"  # 2x T4 NCCL DDP (with NCCL_P2P_DISABLE=1)
+DTYPE = "f32"  # f32 on 1x T4 avoids Burn 0.22.1 Flex32 FlashAttn valid bug & 2x T4 NCCL hangs
+MULTI_GPU = "off"  # single T4 (100% reliable; directly benchmarks Shared RoPE + 50304 vocab vs v2)
 GRAD_CHECKPOINTING = False
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences (matches v2 baseline)
+GRAD_ACCUM_STEPS = 4  # 1x T4 x batch 8 x accum 4 = effective batch 32 sequences (matches v2 baseline)
 BLOCK_SIZE = 256  # 0 = use preset default
 NUM_EPOCHS = 10
 LEARNING_RATE = 3e-4
@@ -171,7 +171,21 @@ def main() -> None:
     run(train_cmd, env=train_env)
     print(f"Training completed in {time.monotonic() - t0:.1f}s", flush=True)
 
-    # 5. Generate sample text from trained checkpoint
+    # 5. Evaluate best checkpoint (Loss, Perplexity, BPB)
+    banner("Evaluating Best Checkpoint")
+    eval_cmd = [
+        binary,
+        "eval",
+        "--artifact-dir", "artifacts",
+        "--dataset", DATASET,
+        "--batch-size", str(BATCH_SIZE),
+        "--dtype", GENERATE_DTYPE,
+    ]
+    if USE_BEST_CHECKPOINT:
+        eval_cmd.append("--best")
+    run(eval_cmd)
+
+    # 6. Generate sample text from trained checkpoint
     banner("Generating Sample Text")
     gen_cmd = [
         binary,

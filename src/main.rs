@@ -1,11 +1,13 @@
 #![recursion_limit = "512"]
 
-use std::str::FromStr;
+use std::{path::Path, str::FromStr};
 
-use burn::{prelude::*, tensor::FloatDType};
+use burn::{config::Config, prelude::*, tensor::FloatDType};
 use clap::{Args, Parser, Subcommand};
 use nanoburngpt::{
+    data::load_text_file,
     datasets::Dataset,
+    eval::run_eval,
     inference::generate_text,
     model::GPTConfig,
     presets::ModelPreset,
@@ -135,6 +137,29 @@ enum Commands {
         #[arg(long, default_value_t = 1.0)]
         repetition_penalty: f64,
         /// Floating-point precision for inference (f32, flex32, bf16, f16)
+        #[arg(long, default_value = "f32")]
+        dtype: String,
+        /// Load best validation checkpoint (`model_best.bpk`) instead of `model_final.bpk`
+        #[arg(long)]
+        best: bool,
+    },
+    /// Evaluate a trained checkpoint on a dataset or text file (Loss, Perplexity, BPB)
+    Eval {
+        #[arg(long, default_value = "artifacts")]
+        artifact_dir: String,
+        /// Built-in dataset whose validation split to evaluate (shakespeare, wikitext103)
+        #[arg(long, default_value = "shakespeare")]
+        dataset: String,
+        /// Optional path to a custom UTF-8 text file (overrides --dataset)
+        #[arg(long)]
+        file: Option<String>,
+        /// Evaluation batch size
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
+        /// Cap evaluated chunks (0 = full validation split)
+        #[arg(long, default_value_t = 0)]
+        max_items: usize,
+        /// Floating-point precision for evaluation (f32, flex32, bf16, f16)
         #[arg(long, default_value = "f32")]
         dtype: String,
         /// Load best validation checkpoint (`model_best.bpk`) instead of `model_final.bpk`
@@ -370,6 +395,62 @@ fn main() -> anyhow::Result<()> {
                 max_tokens,
                 &sampling,
             )?;
+        }
+        Commands::Eval {
+            artifact_dir,
+            dataset,
+            file,
+            batch_size,
+            max_items,
+            dtype,
+            best,
+        } => {
+            let mut device = select_device(cpu);
+            let float_dtype = parse_float_dtype(&dtype)?;
+            if float_dtype != FloatDType::F32 {
+                device.configure(float_dtype).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to configure dtype {:?} on {:?}: {:?}",
+                        float_dtype,
+                        device,
+                        e
+                    )
+                })?;
+            }
+            let config_path = format!("{artifact_dir}/config.json");
+            let config = GPTConfig::load(&config_path)?;
+            let eval_dataset = if let Some(path) = file {
+                load_text_file(Path::new(&path), config.block_size)?
+            } else {
+                let ds = Dataset::from_str(&dataset)?;
+                let (_, val) = ds.load(config.block_size)?;
+                val
+            };
+            let eval_dataset = if max_items > 0 {
+                eval_dataset.with_max_len(max_items)
+            } else {
+                eval_dataset
+            };
+
+            let model_name = if best { "model_best" } else { "model_final" };
+            println!(
+                "Evaluating {model_name} on device: {:?} (dtype: {:?}, chunks: {})",
+                device,
+                float_dtype,
+                eval_dataset.len()
+            );
+            let report = run_eval(device, &artifact_dir, model_name, &eval_dataset, batch_size)?;
+            let tok_s = report.total_tokens as f64 / report.elapsed_secs;
+            println!(
+                "Eval: loss={:.4}  ppl={:.2}  bpb={:.4}  tokens={}  bytes={}  ({:.1}s, {:.0} tok/s)",
+                report.loss,
+                report.perplexity,
+                report.bpb,
+                report.total_tokens,
+                report.total_bytes,
+                report.elapsed_secs,
+                tok_s
+            );
         }
     }
 

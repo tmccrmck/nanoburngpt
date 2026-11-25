@@ -297,7 +297,7 @@ dependencies = [
  "concurrent-queue",
  "event-listener-strategy",
  "futures-core",
- "pin-project-lite 0.2.17",
+ "pin-project-lite",
  "portable-atomic",
  "portable-atomic-util",
 ]
@@ -1019,7 +1019,7 @@ dependencies = [
  "burn-ir",
  "burn-router",
  "burn-std",
- "bytes 1.12.1",
+ "bytes",
  "futures-util",
  "gloo-timers",
  "log",
@@ -1081,7 +1081,7 @@ checksum = "b95efc96ba54fda4ccf77d9c78e839be6a80a635a0f9392236c99b0de375736d"
 dependencies = [
  "ahash",
  "bytemuck",
- "bytes 1.12.1",
+ "bytes",
  "cubecl-common",
  "cubecl-environment",
  "cubecl-zspace",
@@ -1108,7 +1108,7 @@ dependencies = [
  "burn-core",
  "burn-pack",
  "byteorder",
- "bytes 1.12.1",
+ "bytes",
  "half",
  "hashbrown 0.16.1",
  "memmap2",
@@ -1243,12 +1243,6 @@ name = "byteorder-lite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
-
-[[package]]
-name = "bytes"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e4cec68f03f32e44924783795810fa50a7035d8c8ebe78580ad7e6c703fba38"
 
 [[package]]
 name = "bytes"
@@ -1499,13 +1493,12 @@ dependencies = [
 
 [[package]]
 name = "combine"
-version = "4.4.0"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9417a0c314565e2abffaece67e95a8cb51f9238cd39f3764d9dfdf09e72b20c"
+checksum = "4356eba6976435498d05a311ee9fc486da3bc81c200d3f0d7dd9703b41913f92"
 dependencies = [
- "bytes 0.5.6",
+ "bytes",
  "memchr",
- "pin-project-lite 0.1.12",
 ]
 
 [[package]]
@@ -1951,7 +1944,7 @@ dependencies = [
  "backtrace",
  "branches",
  "bytemuck",
- "bytes 1.12.1",
+ "bytes",
  "cfg-if",
  "cfg_aliases",
  "ciborium",
@@ -2974,7 +2967,7 @@ checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
 dependencies = [
  "concurrent-queue",
  "parking",
- "pin-project-lite 0.2.17",
+ "pin-project-lite",
  "portable-atomic",
  "portable-atomic-util",
 ]
@@ -2986,7 +2979,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
- "pin-project-lite 0.2.17",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -3212,7 +3205,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "parking",
- "pin-project-lite 0.2.17",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -3247,7 +3240,7 @@ dependencies = [
  "futures-core",
  "futures-macro",
  "futures-task",
- "pin-project-lite 0.2.17",
+ "pin-project-lite",
  "slab",
 ]
 
@@ -3654,7 +3647,7 @@ version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a"
 dependencies = [
- "bytes 1.12.1",
+ "bytes",
  "itoa",
 ]
 
@@ -5220,12 +5213,6 @@ dependencies = [
 
 [[package]]
 name = "pin-project-lite"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "257b64915a082f7811703966789728173279bdebb956b143dbcd23f6f970a777"
-
-[[package]]
-name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
@@ -5245,12 +5232,14 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "pliron"
 version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d59d619aada2eb8f68bacac30cfa373f4e247c7667cdac69370f5eaf0b87178"
 dependencies = [
  "awint",
  "combine",
  "downcast-rs",
  "dyn-clone",
- "hashbrown 0.17.1",
+ "hashbrown 0.13.2",
  "hi_sparse_bitset",
  "indexmap",
  "inventory",
@@ -5360,7 +5349,7 @@ dependencies = [
  "cfg-if",
  "concurrent-queue",
  "hermit-abi",
- "pin-project-lite 0.2.17",
+ "pin-project-lite",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
@@ -5491,7 +5480,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
- "bytes 1.12.1",
+ "bytes",
  "prost-derive",
 ]
 
@@ -6962,10 +6951,10 @@ version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
- "bytes 1.12.1",
+ "bytes",
  "libc",
  "mio",
- "pin-project-lite 0.2.17",
+ "pin-project-lite",
  "signal-hook-registry",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -7065,7 +7054,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7f3434b87c37611d7298bbf08e0dd47da5a43f3aadf36163b02d77eb01c157"
 dependencies = [
  "anyhow",
- "bytes 1.12.1",
+ "bytes",
  "cc",
  "constcat",
  "dirs 6.0.0",
@@ -7096,7 +7085,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
- "pin-project-lite 0.2.17",
+ "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
 ]
@@ -7332,7 +7321,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8d37dca9e05cc090ca3d73083f82fc63b0d11c33550308ca5d93668a8441b71"
 dependencies = [
  "base64 0.22.1",
- "bytes 1.12.1",
+ "bytes",
  "crc32c",
  "genawaiter",
  "http",

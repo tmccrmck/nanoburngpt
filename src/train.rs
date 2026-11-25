@@ -120,9 +120,6 @@ pub struct TrainingConfig {
     pub artifact_dir: String,
     /// Resume training from a saved checkpoint epoch (e.g. Some(5)).
     pub resume_epoch: Option<usize>,
-    /// Enable mixed precision (AMP / Flex32)
-    #[config(default = false)]
-    pub amp: bool,
     /// Gradient accumulation steps (1 = no accumulation)
     #[config(default = 1)]
     pub grad_accum_steps: usize,
@@ -161,16 +158,17 @@ impl WarmupCosineScheduler {
     }
 
     fn lr_at(&self, iter: usize) -> f64 {
-        if self.warmup_iters > 0 && iter < self.warmup_iters {
-            // Linear ramp: 0 → max_lr over warmup_iters steps
-            self.max_lr * (iter + 1) as f64 / self.warmup_iters as f64
+        let effective_warmup = self.warmup_iters.min(self.total_iters.saturating_sub(1));
+        if effective_warmup > 0 && iter < effective_warmup {
+            // Linear ramp: 0 → max_lr over effective_warmup steps
+            self.max_lr * (iter + 1) as f64 / effective_warmup as f64
         } else if iter >= self.total_iters {
             // Hold at min_lr after the decay is complete
             self.min_lr
         } else {
             // Cosine decay: max_lr → min_lr
-            let progress =
-                (iter - self.warmup_iters) as f64 / (self.total_iters - self.warmup_iters) as f64;
+            let decay_iters = (self.total_iters - effective_warmup).max(1);
+            let progress = (iter - effective_warmup) as f64 / decay_iters as f64;
             let coeff = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
             self.min_lr + coeff * (self.max_lr - self.min_lr)
         }
@@ -299,7 +297,7 @@ impl Metric for LossPerplexityMetric {
         item: &Self::Input,
         _metadata: &MetricMetadata,
     ) -> Result<SerializedEntry, TensorReadError> {
-        let mean_loss = item.loss.clone().mean().try_into_scalar::<f64>()?;
+        let mean_loss = item.loss.clone().try_into_scalar::<f64>()?;
         self.sum_nll += mean_loss * item.num_tokens as f64;
         self.total_tokens += item.num_tokens;
         self.current_ppl = mean_loss.exp();

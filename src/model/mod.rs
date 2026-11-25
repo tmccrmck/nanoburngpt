@@ -32,6 +32,50 @@ pub struct GPTConfig {
     pub rope_theta: f64,
 }
 
+impl GPTConfig {
+    /// Validate architectural invariants before initializing a model.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.vocab_size == 0 {
+            anyhow::bail!("vocab_size must be > 0");
+        }
+        if self.n_layer == 0 {
+            anyhow::bail!("n_layer must be > 0");
+        }
+        if self.n_head == 0 {
+            anyhow::bail!("n_head must be > 0");
+        }
+        if self.n_embd == 0 || !self.n_embd.is_multiple_of(self.n_head) {
+            anyhow::bail!(
+                "n_embd ({}) must be a positive multiple of n_head ({})",
+                self.n_embd,
+                self.n_head
+            );
+        }
+        let head_dim = self.n_embd / self.n_head;
+        if head_dim == 0 || !head_dim.is_multiple_of(2) {
+            anyhow::bail!("head_dim ({head_dim}) must be a positive even number for RoPE");
+        }
+        if let Some(n_kv_head) = self.n_kv_head
+            && (n_kv_head == 0 || !self.n_head.is_multiple_of(n_kv_head))
+        {
+            anyhow::bail!(
+                "n_head ({}) must be a multiple of n_kv_head ({n_kv_head})",
+                self.n_head
+            );
+        }
+        if self.block_size == 0 {
+            anyhow::bail!("block_size must be > 0");
+        }
+        if !(0.0..1.0).contains(&self.dropout) {
+            anyhow::bail!("dropout must be in [0.0, 1.0), got {}", self.dropout);
+        }
+        if !self.rope_theta.is_finite() || self.rope_theta <= 0.0 {
+            anyhow::bail!("rope_theta must be finite and > 0.0, got {}", self.rope_theta);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct MLP {
     c_fc: Linear,
@@ -90,7 +134,7 @@ impl Block {
 
     #[inline]
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let x = x.clone() + self.attn.forward(self.ln_1.forward(x.clone()));
+        let x = x.clone() + self.attn.forward(self.ln_1.forward(x));
         x.clone() + self.mlp.forward(self.ln_2.forward(x))
     }
 
@@ -141,22 +185,25 @@ impl GPT {
     }
 
     #[inline]
-    pub fn forward(&self, idx: Tensor<2, Int>) -> Tensor<3> {
-        let [batch, seq_len] = idx.dims();
+    fn project_lm_head(&self, x: Tensor<3>) -> Tensor<3> {
+        let [batch, seq_len, _] = x.dims();
+        let x = self.ln_f.forward(x);
+        let weight = self.token_embedding.weight.val();
+        let [vocab_size, n_embd] = weight.dims();
+        x.reshape([batch * seq_len, n_embd])
+            .matmul(weight.transpose())
+            .reshape([batch, seq_len, vocab_size])
+    }
 
+    #[inline]
+    pub fn forward(&self, idx: Tensor<2, Int>) -> Tensor<3> {
         let mut x = self.token_embedding.forward(idx);
 
         for block in &self.blocks {
             x = block.forward(x);
         }
 
-        let x = self.ln_f.forward(x);
-
-        let weight = self.token_embedding.weight.val();
-        let [vocab_size, n_embd] = weight.dims();
-        x.reshape([batch * seq_len, n_embd])
-            .matmul(weight.transpose())
-            .reshape([batch, seq_len, vocab_size])
+        self.project_lm_head(x)
     }
 
     /// Forward pass that builds/extends a KV cache for incremental decoding.
@@ -199,21 +246,14 @@ impl GPT {
 
         // During prefill in `generate()`, only the final token's logits are needed;
         // slicing before `ln_f` + `lm_head` saves seq_len× head compute and VRAM.
-        let (x, out_seq) = if last_token_only && seq_len > 1 {
+        let x = if last_token_only && seq_len > 1 {
             let n_embd = x.dims()[2];
-            (x.slice([0..batch, (seq_len - 1)..seq_len, 0..n_embd]), 1)
+            x.slice([0..batch, (seq_len - 1)..seq_len, 0..n_embd])
         } else {
-            (x, seq_len)
+            x
         };
 
-        let x = self.ln_f.forward(x);
-
-        let weight = self.token_embedding.weight.val();
-        let [vocab_size, n_embd] = weight.dims();
-        let logits = x
-            .reshape([batch * out_seq, n_embd])
-            .matmul(weight.transpose())
-            .reshape([batch, out_seq, vocab_size]);
+        let logits = self.project_lm_head(x);
 
         (
             logits,
@@ -223,25 +263,47 @@ impl GPT {
         )
     }
 
-    /// Auto-regressive generation with pre-allocated KV cache and sliding-window roll-over
-    /// past `block_size`.
+    /// Auto-regressive generation without per-token GPU→CPU sync (best for batched/offline use).
+    pub fn generate_tokens(
+        &self,
+        idx: Tensor<2, Int>,
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        block_size: usize,
+    ) -> Tensor<2, Int> {
+        self.generate_inner(idx, max_new_tokens, sampling, block_size, None::<fn(i32)>)
+    }
+
+    /// Auto-regressive generation with pre-allocated KV cache, sliding-window roll-over
+    /// past `block_size`, and streaming token callback (for batch index 0).
     pub fn generate(
         &self,
         idx: Tensor<2, Int>,
         max_new_tokens: usize,
         sampling: &SamplingParams,
         block_size: usize,
-        mut on_token: impl FnMut(i32),
+        on_token: impl FnMut(i32),
+    ) -> Tensor<2, Int> {
+        self.generate_inner(idx, max_new_tokens, sampling, block_size, Some(on_token))
+    }
+
+    fn generate_inner(
+        &self,
+        idx: Tensor<2, Int>,
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        block_size: usize,
+        mut on_token: Option<impl FnMut(i32)>,
     ) -> Tensor<2, Int> {
         let [batch, orig_prompt_len] = idx.dims();
+        if orig_prompt_len == 0 || max_new_tokens == 0 || block_size == 0 {
+            return idx;
+        }
         let idx = if orig_prompt_len > block_size {
             idx.slice([0..batch, (orig_prompt_len - block_size)..orig_prompt_len])
         } else {
             idx
         };
-        if max_new_tokens == 0 || block_size == 0 {
-            return idx;
-        }
 
         let (mut next_logits, mut cache) =
             self.forward_cached_internal(idx.clone(), None, block_size, true);
@@ -271,8 +333,10 @@ impl GPT {
 
             let idx_next = sample_token(&logits, sampling, seen_counts.as_ref());
 
-            let token_id: i32 = idx_next.clone().slice([0..1, 0..1]).into_scalar();
-            on_token(token_id);
+            if let Some(cb) = on_token.as_mut() {
+                let token_id: i32 = idx_next.clone().slice([0..1, 0..1]).into_scalar();
+                cb(token_id);
+            }
 
             generated.push(idx_next.clone());
             if step + 1 == max_new_tokens {

@@ -66,11 +66,15 @@ fn bench_decode_step(c: &mut Criterion) {
             BenchmarkId::new("prompt_len", prompt_len),
             &prompt_len,
             |b, _| {
-                b.iter(|| {
-                    let (logits, _new_cache) =
-                        gpt.forward_cached(next_token.clone(), Some(cache.clone()));
-                    logits
-                })
+                b.iter_batched(
+                    || cache.clone(),
+                    |unique_cache| {
+                        let (logits, _new_cache) =
+                            gpt.forward_cached(next_token.clone(), Some(unique_cache));
+                        logits
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
             },
         );
     }

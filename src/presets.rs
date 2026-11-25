@@ -155,10 +155,9 @@ mod tests {
             assert_eq!(
                 c.n_embd % c.n_head,
                 0,
-                "{} n_embd={} n_head={} — not evenly divisible",
+                "{preset:?} n_embd={} n_head={} — not evenly divisible",
                 c.n_embd,
                 c.n_head,
-                c.n_head
             );
             let head_dim = c.n_embd / c.n_head;
             assert_eq!(

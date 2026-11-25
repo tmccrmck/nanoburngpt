@@ -12,10 +12,29 @@ pub struct SamplingParams {
     /// Nucleus sampling: keep the smallest set of tokens whose cumulative
     /// probability exceeds top_p. 1.0 = disabled.
     pub top_p: f64,
-    /// Repetition penalty: > 1.0 penalizes tokens that have already appeared.
-    /// Applied as logit / penalty for each previous occurrence.
-    /// 1.0 = disabled.
+    /// Repetition penalty: > 1.0 penalizes tokens that have already appeared
+    /// (divides positive logits by `penalty`, multiplies negative logits by `penalty`,
+    /// once per seen token). 1.0 = disabled.
     pub repetition_penalty: f64,
+}
+
+impl SamplingParams {
+    /// Validate sampling hyperparameters before generation.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            anyhow::bail!("temperature must be finite and >= 0.0, got {}", self.temperature);
+        }
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            anyhow::bail!("top_p must be in (0.0, 1.0], got {}", self.top_p);
+        }
+        if !self.repetition_penalty.is_finite() || self.repetition_penalty < 1.0 {
+            anyhow::bail!(
+                "repetition_penalty must be finite and >= 1.0, got {}",
+                self.repetition_penalty
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for SamplingParams {
@@ -130,10 +149,11 @@ pub(crate) fn sample_token(
 
     if use_top_p {
         // Keep the top-1 token (prior_cum == 0.0 < top_p) and every token up through
-        // the first token that crosses top_p.
+        // the first token that crosses top_p. Clamp top_p > 0 so top-1 is never masked.
+        let top_p = params.top_p.max(1e-9);
         let cumprobs = probs.clone().cumsum(1);
         let prior_cum = cumprobs - probs.clone();
-        let exclude = prior_cum.greater_equal_elem(params.top_p);
+        let exclude = prior_cum.greater_equal_elem(top_p);
         probs = probs.mask_fill(exclude, 0.0);
         let sum = probs.clone().sum_dim(1).clamp_min(1e-12);
         probs = probs / sum;
@@ -297,7 +317,7 @@ mod tests {
             [[0.0_f32, 20.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 20.0, 0.0]],
             &device,
         );
-        for (top_k, top_p) in [(0, 0.5), (3, 0.5), (2, 1.0)] {
+        for (top_k, top_p) in [(0, 0.5), (3, 0.5), (2, 1.0), (0, 0.0)] {
             let params = super::SamplingParams {
                 temperature: 1.0,
                 top_k,

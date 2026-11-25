@@ -79,7 +79,14 @@ def main() -> None:
     print(f"Working directory: {Path.cwd()}", flush=True)
     run(["git", "log", "-n", "1", "--oneline"])
     head_sha = subprocess.check_output(
-        ["git", "rev-parse", "HEAD:Cargo.toml", "HEAD:Cargo.lock", "HEAD:src"],
+        [
+            "git",
+            "rev-parse",
+            "HEAD:Cargo.toml",
+            "HEAD:Cargo.lock",
+            "HEAD:src",
+            "HEAD:vendor/pliron",
+        ],
         text=True,
     ).strip().replace("\n", "-")
     print(f"Rust source key: {head_sha}", flush=True)

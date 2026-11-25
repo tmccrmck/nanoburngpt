@@ -1,5 +1,6 @@
 use crate::data::BpeTokenizer;
 use crate::model::{GPT, GPTConfig, SamplingParams};
+use anyhow::Context;
 use burn::{config::Config, module::Module, prelude::*};
 use std::io::{self, Write};
 
@@ -10,10 +11,14 @@ pub fn generate_text(
     prompt: &str,
     max_tokens: usize,
     sampling: &SamplingParams,
-) {
+) -> anyhow::Result<String> {
+    sampling.validate()?;
+
     // 1. Load Config
     let config_path = format!("{}/config.json", artifact_dir);
-    let config = GPTConfig::load(&config_path).expect("Config should exist");
+    let config = GPTConfig::load(&config_path)
+        .with_context(|| format!("Failed to load model config from {config_path}"))?;
+    config.validate()?;
 
     // 2. Tokenizer — BPE vocab is fixed, no artifact needed
     let tokenizer = BpeTokenizer::new();
@@ -23,7 +28,11 @@ pub fn generate_text(
     println!("Loading model from {model_path} ...");
     let model = GPT::new(&config, &device)
         .try_load_file(&model_path)
-        .expect("Model checkpoint not found. Run `cargo run -- train` first.");
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load model checkpoint '{model_path}': {e:?}. Run `cargo run -- train` first."
+            )
+        })?;
 
     // 4. Encode Prompt (prepend BOS if prompt is empty to avoid 0-length prefill)
     let mut tokens = tokenizer.encode(prompt);
@@ -34,6 +43,7 @@ pub fn generate_text(
         Tensor::<1, Int>::from_ints(tokens.as_slice(), &device).unsqueeze::<2>();
 
     // 5. Generate with UTF-8-safe streaming output
+    let mut output = String::from(prompt);
     print!("{prompt}");
     io::stdout().flush().ok();
 
@@ -47,6 +57,7 @@ pub fn generate_text(
             pending.push(token_id as usize);
             let text = tokenizer.decode(&pending);
             if !text.is_empty() && !text.contains('\u{FFFD}') {
+                output.push_str(&text);
                 print!("{text}");
                 io::stdout().flush().ok();
                 pending.clear();
@@ -54,9 +65,12 @@ pub fn generate_text(
         },
     );
     if !pending.is_empty() {
-        print!("{}", tokenizer.decode(&pending));
+        let tail = tokenizer.decode(&pending);
+        output.push_str(&tail);
+        print!("{tail}");
         io::stdout().flush().ok();
     }
 
     println!();
+    Ok(output)
 }

@@ -2,11 +2,18 @@ use burn::{
     data::{dataloader::batcher::Batcher, dataset::{Dataset, DatasetError}},
     prelude::*,
 };
-use std::{path::Path, sync::Arc};
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+    sync::Arc,
+};
 use tiktoken_rs::r50k_base;
 
 pub struct TextDataset {
     pub data: Arc<[i32]>,
+    start_offset: usize,
+    token_len: usize,
     block_size: usize,
     max_len: Option<usize>,
 }
@@ -18,8 +25,21 @@ impl TextDataset {
     }
 
     pub fn from_tokens(data: Arc<[i32]>, block_size: usize) -> Self {
+        let token_len = data.len();
+        Self::from_tokens_range(data, 0, token_len, block_size)
+    }
+
+    pub fn from_tokens_range(
+        data: Arc<[i32]>,
+        start_offset: usize,
+        token_len: usize,
+        block_size: usize,
+    ) -> Self {
+        debug_assert!(start_offset + token_len <= data.len());
         Self {
             data,
+            start_offset,
+            token_len,
             block_size,
             max_len: None,
         }
@@ -31,10 +51,10 @@ impl TextDataset {
     }
 
     fn raw_len(&self) -> usize {
-        if self.block_size == 0 || self.data.len() <= self.block_size {
+        if self.block_size == 0 || self.token_len <= self.block_size {
             0
         } else {
-            (self.data.len() - 1) / self.block_size
+            (self.token_len - 1) / self.block_size
         }
     }
 
@@ -53,7 +73,7 @@ impl Dataset<TextDatasetItem> for TextDataset {
             panic!("TextDataset index out of bounds: {index} >= {}", self.len());
         }
 
-        let start = index * self.block_size;
+        let start = self.start_offset + index * self.block_size;
         Ok(TextDatasetItem {
             data: Arc::clone(&self.data),
             start,
@@ -180,20 +200,28 @@ impl BpeTokenizer {
 // Generic text-file loader (dataset-agnostic)
 // ---------------------------------------------------------------------------
 
-/// Tokenize text from a file, cache the token IDs as a `.bin` for fast reloads.
+/// Tokenize text from a file, atomically cache the token IDs as a `.bin` for fast reloads.
 fn tokenize_and_cache(text_path: &Path, bin_path: &Path) -> anyhow::Result<Vec<i32>> {
     let text = std::fs::read_to_string(text_path)?;
     let tokenizer = BpeTokenizer::new();
     let encoded = tokenizer.encode(&text);
+    drop(text);
+
     let mut tokens = Vec::with_capacity(encoded.len() + 1);
     tokens.push(BpeTokenizer::BOS_TOKEN as i32);
     tokens.extend(encoded.into_iter().map(|t| t as i32));
 
-    let bytes: Vec<u8> = tokens
-        .iter()
-        .flat_map(|&t| (t as u32).to_le_bytes())
-        .collect();
-    std::fs::write(bin_path, bytes)?;
+    // Stream via BufWriter to a sibling temp file and rename atomically so an
+    // interrupted run never leaves a corrupt `.bin` cache.
+    let tmp_path = bin_path.with_extension("bin.tmp");
+    {
+        let mut writer = BufWriter::new(File::create(&tmp_path)?);
+        for &t in &tokens {
+            writer.write_all(&(t as u32).to_le_bytes())?;
+        }
+        writer.flush()?;
+    }
+    std::fs::rename(&tmp_path, bin_path)?;
 
     Ok(tokens)
 }
@@ -201,6 +229,13 @@ fn tokenize_and_cache(text_path: &Path, bin_path: &Path) -> anyhow::Result<Vec<i
 /// Load a pre-tokenized `.bin` file (raw u32 LE tokens) directly into `Vec<i32>`.
 fn load_cached(bin_path: &Path) -> anyhow::Result<Vec<i32>> {
     let bytes = std::fs::read(bin_path)?;
+    if !bytes.len().is_multiple_of(4) {
+        anyhow::bail!(
+            "Corrupt token cache {} (byte length {} is not a multiple of 4); delete it to re-tokenize.",
+            bin_path.display(),
+            bytes.len()
+        );
+    }
     let tokens = bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as i32)
@@ -208,36 +243,33 @@ fn load_cached(bin_path: &Path) -> anyhow::Result<Vec<i32>> {
     Ok(tokens)
 }
 
-/// Load a single text file (or its cached `.bin`) into a `TextDataset`.
-pub fn load_text_file(path: &Path, block_size: usize) -> anyhow::Result<TextDataset> {
+fn load_or_tokenize(path: &Path) -> anyhow::Result<Arc<[i32]>> {
     let bin_path = path.with_extension("bin");
     let data = if bin_path.exists() {
         load_cached(&bin_path)?
     } else {
         tokenize_and_cache(path, &bin_path)?
     };
-    Ok(TextDataset::from_tokens(Arc::from(data), block_size))
+    Ok(Arc::from(data))
+}
+
+/// Load a single text file (or its cached `.bin`) into a `TextDataset`.
+pub fn load_text_file(path: &Path, block_size: usize) -> anyhow::Result<TextDataset> {
+    let data = load_or_tokenize(path)?;
+    Ok(TextDataset::from_tokens(data, block_size))
 }
 
 /// Load a text file (or its cached `.bin`), tokenize with BPE, prepend BOS,
-/// split 90/10 train/val. Caches token IDs on first run — subsequent loads
-/// skip BPE encoding entirely.
+/// split 90/10 train/val sharing a single `Arc<[i32]>` buffer. Caches token IDs
+/// on first run — subsequent loads skip BPE encoding entirely.
 pub fn load_text(path: &Path, block_size: usize) -> anyhow::Result<(TextDataset, TextDataset)> {
-    let bin_path = path.with_extension("bin");
-    let data = if bin_path.exists() {
-        load_cached(&bin_path)?
-    } else {
-        tokenize_and_cache(path, &bin_path)?
-    };
-
+    let data = load_or_tokenize(path)?;
     let n = data.len();
     let split = (n as f64 * 0.9) as usize;
-    let train: Arc<[i32]> = Arc::from(&data[..split]);
-    let val: Arc<[i32]> = Arc::from(&data[split..]);
 
     Ok((
-        TextDataset::from_tokens(train, block_size),
-        TextDataset::from_tokens(val, block_size),
+        TextDataset::from_tokens_range(Arc::clone(&data), 0, split, block_size),
+        TextDataset::from_tokens_range(data, split, n - split, block_size),
     ))
 }
 

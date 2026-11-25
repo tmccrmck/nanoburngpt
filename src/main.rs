@@ -216,9 +216,7 @@ fn main() -> anyhow::Result<()> {
                 multi_gpu,
                 no_tui,
             } = *args;
-            let preset = model
-                .parse::<ModelPreset>()
-                .expect("Invalid --model. Use: nano, gpt2-small, gpt2-medium, gpt2-large, gpt2-xl");
+            let preset = model.parse::<ModelPreset>()?;
             let preset_cfg = preset.config();
 
             let gpt_config = GPTConfig {
@@ -231,9 +229,9 @@ fn main() -> anyhow::Result<()> {
                 dropout: dropout.unwrap_or(preset_cfg.dropout),
                 rope_theta,
             };
+            gpt_config.validate()?;
 
-            let dataset_enum = Dataset::from_str(&dataset)
-                .expect("Invalid --dataset. Use: shakespeare, wikitext103");
+            let dataset_enum = Dataset::from_str(&dataset)?;
             let multi_gpu_mode = MultiGpuMode::from_str(&multi_gpu)?;
             let optimizer_choice = OptimizerChoice::from_str(&optimizer)?;
             let float_dtype = match &dtype {
@@ -290,7 +288,6 @@ fn main() -> anyhow::Result<()> {
                 max_val_items,
                 artifact_dir,
                 resume_epoch: resume,
-                amp: amp || float_dtype != FloatDType::F32,
                 grad_accum_steps,
                 grad_checkpointing,
                 no_tui,
@@ -361,7 +358,7 @@ fn main() -> anyhow::Result<()> {
                 &prompt,
                 max_tokens,
                 &sampling,
-            );
+            )?;
         }
     }
 

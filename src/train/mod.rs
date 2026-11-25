@@ -125,21 +125,53 @@ pub struct TrainingConfig {
 
 impl GPT {
     pub fn forward_loss(&self, item: TextGenerationBatch) -> LmLossOutput {
+        self.forward_loss_chunked(item, 0)
+    }
+
+    /// Compute cross-entropy loss, optionally chunking the `[batch * seq, vocab]` LM-head
+    /// projection + `log_softmax` into slices of `chunk_tokens` tokens to reduce working-set
+    /// size and peak logits VRAM. `chunk_tokens == 0` disables chunking.
+    pub fn forward_loss_chunked(
+        &self,
+        item: TextGenerationBatch,
+        chunk_tokens: usize,
+    ) -> LmLossOutput {
         let targets = item.targets; // [batch, seq]
         let [batch_size, seq_len] = targets.dims();
         let num_tokens = batch_size * seq_len;
 
-        let logits = self.forward(item.inputs); // [batch, seq, vocab]
-        let [_, _, vocab_size] = logits.dims();
-
-        let logits_flat = logits.reshape([num_tokens, vocab_size]);
+        let hidden = self.forward_hidden(item.inputs); // [batch, seq, n_embd]
+        let n_embd = hidden.dims()[2];
+        let hidden_flat = hidden.reshape([num_tokens, n_embd]);
         let targets_flat = targets.reshape([num_tokens]);
+        let ce = CrossEntropyLossConfig::new().init(&hidden_flat.device());
 
-        let loss = CrossEntropyLossConfig::new()
-            .init(&logits_flat.device())
-            .forward(logits_flat, targets_flat);
+        if chunk_tokens == 0 || num_tokens <= chunk_tokens {
+            let logits_flat = self.project_hidden_2d(hidden_flat);
+            let loss = ce.forward(logits_flat, targets_flat);
+            return LmLossOutput { loss, num_tokens };
+        }
 
-        LmLossOutput { loss, num_tokens }
+        let mut total_loss: Option<Tensor<1>> = None;
+        let mut start = 0usize;
+        while start < num_tokens {
+            let end = (start + chunk_tokens).min(num_tokens);
+            let len = end - start;
+            let h_chunk = hidden_flat.clone().slice([start..end, 0..n_embd]);
+            let logits_chunk = self.project_hidden_2d(h_chunk);
+            let t_chunk = targets_flat.clone().slice(start..end);
+            let weighted = ce.forward(logits_chunk, t_chunk) * (len as f64 / num_tokens as f64);
+            total_loss = Some(match total_loss {
+                Some(acc) => acc + weighted,
+                None => weighted,
+            });
+            start = end;
+        }
+
+        LmLossOutput {
+            loss: total_loss.expect("num_tokens > 0"),
+            num_tokens,
+        }
     }
 }
 
@@ -616,5 +648,37 @@ mod tests {
         assert_eq!(best, Some((2, 95.5)));
         assert_eq!(std::fs::read(dir.join("model_best.bpk")).unwrap(), b"ep2");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunked_loss_matches_unchunked_loss() {
+        let device = Device::flex();
+        let config = GPTConfig {
+            vocab_size: 32,
+            n_layer: 1,
+            n_head: 2,
+            n_embd: 16,
+            n_kv_head: None,
+            block_size: 8,
+            dropout: 0.0,
+            rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 15.0,
+        };
+        let model = GPT::new(&config, &device);
+        let inputs = Tensor::<1, Int>::arange(0..16_i64, &device).reshape([2, 8]);
+        let targets = Tensor::<1, Int>::arange(1..17_i64, &device).reshape([2, 8]);
+        let batch = TextGenerationBatch {
+            inputs,
+            targets,
+            loss_scale: 1.0,
+        };
+
+        let full: f32 = model.forward_loss_chunked(batch.clone(), 0).loss.into_scalar();
+        let chunked: f32 = model.forward_loss_chunked(batch, 5).loss.into_scalar();
+        assert!(
+            (full - chunked).abs() < 1e-5,
+            "chunked loss {chunked} differs from unchunked {full}"
+        );
     }
 }

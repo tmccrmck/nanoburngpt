@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use burn::{prelude::*, train::TrainStep};
+use burn::{optim::GradientsParams, prelude::*};
 
 use crate::{
     data::TextGenerationBatch,
@@ -30,6 +30,7 @@ pub fn run_bench(
     warmup_steps: usize,
     timed_steps: usize,
     decode_tokens: usize,
+    ce_chunk_size: usize,
 ) -> anyhow::Result<BenchReport> {
     gpt_config.validate()?;
     let batch_size = batch_size.max(1);
@@ -48,11 +49,17 @@ pub fn run_bench(
     };
 
     for _ in 0..warmup_steps {
-        let _: f32 = eval_model.forward_loss(eval_batch.clone()).loss.into_scalar();
+        let _: f32 = eval_model
+            .forward_loss_chunked(eval_batch.clone(), ce_chunk_size)
+            .loss
+            .into_scalar();
     }
     let t0 = Instant::now();
     for _ in 0..timed_steps {
-        let _: f32 = eval_model.forward_loss(eval_batch.clone()).loss.into_scalar();
+        let _: f32 = eval_model
+            .forward_loss_chunked(eval_batch.clone(), ce_chunk_size)
+            .loss
+            .into_scalar();
     }
     let eval_secs = t0.elapsed().as_secs_f64().max(1e-9);
     let eval_ms_per_step = (eval_secs / timed_steps as f64) * 1000.0;
@@ -95,21 +102,26 @@ pub fn run_bench(
     };
 
     for _ in 0..warmup_steps {
-        let out = TrainStep::step(&train_model, train_batch.clone());
-        train_model = optim.step(3e-4, train_model, out.grads);
+        let out = train_model.forward_loss_chunked(train_batch.clone(), ce_chunk_size);
+        let grads = GradientsParams::from_grads(out.loss.backward(), &train_model);
+        train_model = optim.step(3e-4, train_model, grads);
     }
     let _: f32 = train_model
-        .forward_loss(train_batch.clone())
+        .forward_loss_chunked(train_batch.clone(), ce_chunk_size)
         .loss
         .into_scalar();
 
     let t0 = Instant::now();
     for _ in 0..timed_steps {
-        let out = TrainStep::step(&train_model, train_batch.clone());
-        train_model = optim.step(3e-4, train_model, out.grads);
+        let out = train_model.forward_loss_chunked(train_batch.clone(), ce_chunk_size);
+        let grads = GradientsParams::from_grads(out.loss.backward(), &train_model);
+        train_model = optim.step(3e-4, train_model, grads);
     }
     // Sync final optimizer update before stopping timer
-    let _: f32 = train_model.forward_loss(train_batch).loss.into_scalar();
+    let _: f32 = train_model
+        .forward_loss_chunked(train_batch, ce_chunk_size)
+        .loss
+        .into_scalar();
     let train_secs = t0.elapsed().as_secs_f64().max(1e-9);
     // Subtract 1 eval pass amortized across timed_steps for clean train step timing
     let train_only_secs = (train_secs - (eval_secs / timed_steps as f64)).max(1e-9);
@@ -152,6 +164,7 @@ mod tests {
             1,
             2,
             4,
+            16,
         )
         .unwrap();
         assert!(report.eval_tok_per_sec > 0.0);

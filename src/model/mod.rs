@@ -223,16 +223,34 @@ impl GPT {
         }
     }
 
+    /// Run the transformer trunk (`token_embedding` → `blocks` → `ln_f`) without the final
+    /// `lm_head` vocabulary projection. Returns `[batch, seq_len, n_embd]`.
     #[inline]
-    fn project_lm_head(&self, x: Tensor<3>) -> Tensor<3> {
-        let [batch, seq_len, _] = x.dims();
-        let x = self.ln_f.forward(x);
+    pub fn forward_hidden(&self, idx: Tensor<2, Int>) -> Tensor<3> {
+        let [_, seq_len] = idx.dims();
+        let mut x = self.token_embedding.forward(idx);
+        let rope = self.rope.slice(0, seq_len);
+
+        // Pass precomputed mask under autodiff or Flex32 (which use attention_fallback);
+        // keep `None` + `is_causal: true` for F32/BF16/F16 inference so FlashAttention runs natively.
+        let use_precomputed_mask =
+            x.device().is_autodiff() || x.dtype() == burn::tensor::DType::Flex32;
+        let causal_mask = use_precomputed_mask
+            .then(|| self.causal_mask.clone().slice([0..1, 0..1, 0..seq_len, 0..seq_len]));
+
+        for block in &self.blocks {
+            x = block.forward(x, &rope, causal_mask.as_ref());
+        }
+
+        self.ln_f.forward(x)
+    }
+
+    /// Project normalized 2D hidden states `[tokens, n_embd]` to logits `[tokens, vocab_size]`
+    /// with optional output logit softcap.
+    #[inline]
+    pub(crate) fn project_hidden_2d(&self, hidden: Tensor<2>) -> Tensor<2> {
         let weight = self.token_embedding.weight.val();
-        let [vocab_size, n_embd] = weight.dims();
-        let logits = x
-            .reshape([batch * seq_len, n_embd])
-            .matmul(weight.transpose())
-            .reshape([batch, seq_len, vocab_size]);
+        let logits = hidden.matmul(weight.transpose());
         if self.logit_softcap > 0.0 {
             let cap = self.logit_softcap;
             (logits / cap).tanh() * cap
@@ -242,23 +260,21 @@ impl GPT {
     }
 
     #[inline]
+    fn project_lm_head(&self, x: Tensor<3>) -> Tensor<3> {
+        let [batch, seq_len, n_embd] = x.dims();
+        let x = self.ln_f.forward(x);
+        let logits = self.project_hidden_2d(x.reshape([batch * seq_len, n_embd]));
+        let vocab_size = logits.dims()[1];
+        logits.reshape([batch, seq_len, vocab_size])
+    }
+
+    #[inline]
     pub fn forward(&self, idx: Tensor<2, Int>) -> Tensor<3> {
-        let [_, seq_len] = idx.dims();
-        let mut x = self.token_embedding.forward(idx);
-        let rope = self.rope.slice(0, seq_len);
-
-        // Pass precomputed mask under autodiff (which always uses attention_fallback);
-        // keep `None` + `is_causal: true` for inference so FlashAttention uses its native path.
-        let causal_mask = x
-            .device()
-            .is_autodiff()
-            .then(|| self.causal_mask.clone().slice([0..1, 0..1, 0..seq_len, 0..seq_len]));
-
-        for block in &self.blocks {
-            x = block.forward(x, &rope, causal_mask.as_ref());
-        }
-
-        self.project_lm_head(x)
+        let hidden = self.forward_hidden(idx);
+        let [batch, seq_len, n_embd] = hidden.dims();
+        let logits = self.project_hidden_2d(hidden.reshape([batch * seq_len, n_embd]));
+        let vocab_size = logits.dims()[1];
+        logits.reshape([batch, seq_len, vocab_size])
     }
 
     /// Forward pass that builds/extends a KV cache for incremental decoding.

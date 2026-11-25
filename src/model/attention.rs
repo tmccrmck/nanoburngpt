@@ -232,7 +232,7 @@ impl CausalSelfAttention {
         rope: &RotarySlice,
         causal_mask: Option<&Tensor<4, Bool>>,
     ) -> Tensor<3> {
-        let (q, k, v, batch_size, seq_len, _) = self.split_qkv(x);
+        let (q, k, v, batch_size, seq_len, head_dim) = self.split_qkv(x);
 
         let q = rope.apply(q);
         let k = rope.apply(k);
@@ -252,6 +252,11 @@ impl CausalSelfAttention {
             ),
             None => (None, true),
         };
+        // Burn 0.22.1's `cubek-attention` FlashAttention kernel returns corrupted outputs under
+        // `Flex32` on T4 (`sm_75`). Passing explicit `scale` routes `Flex32` inference/validation
+        // through Burn's exact `attention_fallback` while keeping FlashAttention for F32/BF16/F16.
+        let scale = (q.dtype() == burn::tensor::DType::Flex32)
+            .then(|| 1.0 / (head_dim as f64).sqrt());
 
         let y = attention(
             q,
@@ -260,6 +265,7 @@ impl CausalSelfAttention {
             mask,
             None,
             AttentionModuleOptions {
+                scale,
                 is_causal,
                 ..Default::default()
             },
@@ -345,6 +351,8 @@ impl CausalSelfAttention {
             (k_valid, v_valid)
         };
 
+        let scale = (q.dtype() == burn::tensor::DType::Flex32)
+            .then(|| 1.0 / (head_dim as f64).sqrt());
         let y = attention(
             q,
             k_att,
@@ -352,6 +360,7 @@ impl CausalSelfAttention {
             None,
             None,
             AttentionModuleOptions {
+                scale,
                 // Single-token decode attends to all cached positions; skip causal mask kernels.
                 is_causal: seq_len > 1,
                 ..Default::default()

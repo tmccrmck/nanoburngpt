@@ -199,6 +199,9 @@ enum Commands {
         /// Output logit softcap (0.0 = disabled)
         #[arg(long, default_value_t = 0.0)]
         logit_softcap: f64,
+        /// Chunk size (in tokens) for LM-head + cross-entropy loss (0 = unchunked)
+        #[arg(long, default_value_t = 0)]
+        ce_chunk_size: usize,
     },
 }
 
@@ -497,6 +500,7 @@ fn main() -> anyhow::Result<()> {
             decode_tokens,
             qk_norm,
             logit_softcap,
+            ce_chunk_size,
         } => {
             let preset = model.parse::<ModelPreset>()?;
             let mut gpt_config = preset.config();
@@ -530,6 +534,7 @@ fn main() -> anyhow::Result<()> {
                 warmup,
                 steps,
                 decode_tokens,
+                ce_chunk_size,
             )?;
             println!(
                 "  Eval   : {:>7.1} ms/step  ({:>8.0} tok/s)",

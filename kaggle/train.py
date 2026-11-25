@@ -13,22 +13,22 @@ from pathlib import Path
 REPO_URL = "https://github.com/tmccrmck/nanoburngpt.git"
 BRANCH = "main"
 
-MODEL = "nano"
+MODEL = "gpt2-small"
 DATASET = "shakespeare"
 OPTIMIZER = "adamw"  # adamw or muon (Muon for 2D block weights + AdamW for embeddings/norms)
 DTYPE = "f32"  # f32 enables 2x T4 multi-GPU and avoids Burn 0.22.1 Flex32 FlashAttn valid bug on T4
-MULTI_GPU = "ddp"  # test 2x T4 NCCL DDP with NCCL_P2P_DISABLE=1
+MULTI_GPU = "ddp"  # 2x T4 NCCL DDP (with NCCL_P2P_DISABLE=1)
 GRAD_CHECKPOINTING = False
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences
+GRAD_ACCUM_STEPS = 2  # 2x T4 x batch 8 x accum 2 = effective batch 32 sequences (matches v2 baseline)
 BLOCK_SIZE = 256  # 0 = use preset default
-NUM_EPOCHS = 1
+NUM_EPOCHS = 10
 LEARNING_RATE = 3e-4
-WARMUP_ITERS = 2
+WARMUP_ITERS = 30
 NUM_WORKERS = 2
 # 0 = full dataset (e.g. set MAX_TRAIN_ITEMS = 128, MODEL = "nano",
 # NUM_EPOCHS = 1 for a quick end-to-end smoke test).
-MAX_TRAIN_ITEMS = 128
+MAX_TRAIN_ITEMS = 0
 
 GENERATE_PROMPT = "HAMLET:\n"
 GENERATE_TOKENS = 200
@@ -78,8 +78,11 @@ def main() -> None:
     os.chdir(REPO_DIR)
     print(f"Working directory: {Path.cwd()}", flush=True)
     run(["git", "log", "-n", "1", "--oneline"])
-    head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    print(f"HEAD SHA: {head_sha}", flush=True)
+    head_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD:Cargo.toml", "HEAD:Cargo.lock", "HEAD:src"],
+        text=True,
+    ).strip().replace("\n", "-")
+    print(f"Rust source key: {head_sha}", flush=True)
 
     # 3. Restore cached CUDA binary if SHA matches, otherwise install Rust & build
     binary_path = REPO_DIR / "target/release/nanoburngpt"

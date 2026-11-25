@@ -193,7 +193,7 @@ pub(crate) fn compute_total_optimizer_steps(
 
 pub(crate) fn build_optimizer(choice: OptimizerChoice) -> ModuleOptimizer {
     let grad_clip = GradientClippingConfig::Norm(1.0);
-    let norm_group = ParamGroup::from_any_predicates(vec!["ln_1", "ln_2", "ln_f"]);
+    let norm_group = ParamGroup::from_any_predicates(vec!["ln_1", "ln_2", "ln_f", "q_norm", "k_norm"]);
     let norm_adamw = AdamWConfig::new()
         .with_beta_1(0.9)
         .with_beta_2(0.95)
@@ -326,6 +326,7 @@ pub fn run_training_with_datasets(
         1.0 / grad_accum as f64
     };
 
+    let train_dataset = train_dataset.with_chunk_jitter(true);
     let train_dataset = if training_config.max_train_items > 0 {
         train_dataset.with_max_len(training_config.max_train_items)
     } else {
@@ -502,6 +503,8 @@ mod tests {
             block_size,
             dropout: 0.0,
             rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 0.0,
         };
         let mut model = GPT::new(&config, &device);
 
@@ -555,6 +558,8 @@ mod tests {
                 block_size,
                 dropout: 0.0,
                 rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 0.0,
             };
             let mut model = GPT::new(&config, &device);
             let mut optim = build_optimizer(choice);

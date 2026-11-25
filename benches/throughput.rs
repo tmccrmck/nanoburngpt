@@ -23,6 +23,8 @@ fn make_config(n_layer: usize, n_head: usize, n_embd: usize, block_size: usize) 
         block_size,
         dropout: 0.0,
         rope_theta: 10000.0,
+        qk_norm: false,
+        logit_softcap: 0.0,
     }
 }
 

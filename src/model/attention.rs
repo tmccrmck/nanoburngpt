@@ -2,7 +2,7 @@ use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 use burn::{
     module::Module,
-    nn::{Dropout, DropoutConfig, Initializer, Linear, LinearConfig},
+    nn::{Dropout, DropoutConfig, Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig},
     prelude::*,
 };
 use super::GPTConfig;
@@ -102,6 +102,8 @@ pub struct CausalSelfAttention {
     c_attn: Linear,
     c_proj: Linear,
     resid_dropout: Dropout,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     n_head: usize,
     n_kv_head: usize,
     n_embd: usize,
@@ -121,6 +123,14 @@ impl CausalSelfAttention {
         let c_attn_out_dim = (config.n_head + 2 * n_kv_head) * head_dim;
 
         let proj_std = 0.02 / (2.0 * config.n_layer as f64).sqrt();
+        let (q_norm, k_norm) = if config.qk_norm {
+            (
+                Some(RmsNormConfig::new(head_dim).init(device)),
+                Some(RmsNormConfig::new(head_dim).init(device)),
+            )
+        } else {
+            (None, None)
+        };
         Self {
             c_attn: LinearConfig::new(config.n_embd, c_attn_out_dim)
                 .with_bias(false)
@@ -137,6 +147,8 @@ impl CausalSelfAttention {
                 })
                 .init(device),
             resid_dropout: DropoutConfig::new(config.dropout).init(),
+            q_norm,
+            k_norm,
             n_head: config.n_head,
             n_kv_head,
             n_embd: config.n_embd,
@@ -174,11 +186,25 @@ impl CausalSelfAttention {
     }
 
     #[inline]
+    fn apply_qk_norm(&self, q: Tensor<4>, k: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
+        let q = match &self.q_norm {
+            Some(norm) => norm.forward(q),
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(norm) => norm.forward(k),
+            None => k,
+        };
+        (q, k)
+    }
+
+    #[inline]
     pub fn forward(&self, x: Tensor<3>, rope: &RotaryCache) -> Tensor<3> {
         let (q, k, v, batch_size, seq_len, _) = self.split_qkv(x);
 
         let q = rope.apply(q, 0);
         let k = rope.apply(k, 0);
+        let (q, k) = self.apply_qk_norm(q, k);
 
         let (k, v) = if self.n_kv_head < self.n_head {
             let reps = self.n_head / self.n_kv_head;
@@ -219,6 +245,7 @@ impl CausalSelfAttention {
 
         let q = rope.apply(q, pos_offset);
         k = rope.apply(k, pos_offset);
+        let (q, k) = self.apply_qk_norm(q, k);
 
         let new_len = pos_offset + seq_len;
         let (mut k_buf, mut v_buf) = match cache {
@@ -323,6 +350,8 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 0.0,
         }
     }
 
@@ -336,6 +365,8 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 0.0,
         }
     }
 

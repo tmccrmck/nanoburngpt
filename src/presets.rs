@@ -26,6 +26,8 @@ impl ModelPreset {
                 block_size: 32,
                 dropout: 0.0,
                 rope_theta: 10000.0,
+                qk_norm: false,
+                logit_softcap: 0.0,
             },
             Self::Gpt2Small => GPTConfig {
                 vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
@@ -36,6 +38,8 @@ impl ModelPreset {
                 block_size: 1024,
                 dropout: 0.1,
                 rope_theta: 10000.0,
+                qk_norm: false,
+                logit_softcap: 0.0,
             },
             Self::Gpt2Medium => GPTConfig {
                 vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
@@ -46,6 +50,8 @@ impl ModelPreset {
                 block_size: 1024,
                 dropout: 0.1,
                 rope_theta: 10000.0,
+                qk_norm: false,
+                logit_softcap: 0.0,
             },
             Self::Gpt2Large => GPTConfig {
                 vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
@@ -56,6 +62,8 @@ impl ModelPreset {
                 block_size: 1024,
                 dropout: 0.1,
                 rope_theta: 10000.0,
+                qk_norm: false,
+                logit_softcap: 0.0,
             },
             Self::Gpt2Xl => GPTConfig {
                 vocab_size: BpeTokenizer::PADDED_VOCAB_SIZE,
@@ -66,6 +74,8 @@ impl ModelPreset {
                 block_size: 1024,
                 dropout: 0.1,
                 rope_theta: 10000.0,
+                qk_norm: false,
+                logit_softcap: 0.0,
             },
         }
     }

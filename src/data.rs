@@ -6,9 +6,19 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tiktoken_rs::r50k_base;
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
 
 pub struct TextDataset {
     pub data: Arc<[i32]>,
@@ -16,6 +26,8 @@ pub struct TextDataset {
     token_len: usize,
     block_size: usize,
     max_len: Option<usize>,
+    chunk_jitter: bool,
+    access_count: AtomicUsize,
 }
 
 impl TextDataset {
@@ -42,6 +54,8 @@ impl TextDataset {
             token_len,
             block_size,
             max_len: None,
+            chunk_jitter: false,
+            access_count: AtomicUsize::new(0),
         }
     }
 
@@ -50,9 +64,22 @@ impl TextDataset {
         self
     }
 
+    /// Enable per-epoch pseudo-random chunk offset jitter (`0..block_size`) so
+    /// repeated epochs see shifted context boundaries (reduces overfitting on small corpora).
+    pub fn with_chunk_jitter(mut self, enabled: bool) -> Self {
+        self.chunk_jitter = enabled;
+        self
+    }
+
+    fn jitter_active(&self) -> bool {
+        self.chunk_jitter && self.block_size > 1 && self.token_len > 2 * self.block_size
+    }
+
     fn raw_len(&self) -> usize {
         if self.block_size == 0 || self.token_len <= self.block_size {
             0
+        } else if self.jitter_active() {
+            (self.token_len - 1 - self.block_size) / self.block_size
         } else {
             (self.token_len - 1) / self.block_size
         }
@@ -69,11 +96,20 @@ impl TextDataset {
 
 impl Dataset<TextDatasetItem> for TextDataset {
     fn get(&self, index: usize) -> Result<TextDatasetItem, DatasetError> {
-        if index >= self.len() {
-            panic!("TextDataset index out of bounds: {index} >= {}", self.len());
+        let len = self.len();
+        if index >= len {
+            panic!("TextDataset index out of bounds: {index} >= {len}");
         }
 
-        let start = self.start_offset + index * self.block_size;
+        let jitter_offset = if self.jitter_active() {
+            let count = self.access_count.fetch_add(1, Ordering::Relaxed);
+            let epoch = count / len;
+            (splitmix64(epoch as u64) as usize) % self.block_size
+        } else {
+            0
+        };
+
+        let start = self.start_offset + jitter_offset + index * self.block_size;
         Ok(TextDatasetItem {
             data: Arc::clone(&self.data),
             start,
@@ -365,6 +401,21 @@ mod tests {
         let encoded = tok.encode(text);
         let decoded = tok.decode(&encoded);
         assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn chunk_jitter_shifts_boundaries_across_epochs() {
+        let block_size = 4;
+        let ds = make_dataset(40, block_size).with_chunk_jitter(true);
+        let len = ds.len();
+        assert!(len > 0);
+        // Drain epoch 0 and epoch 1; their index-0 inputs should start at different offsets.
+        let ep0_first = ds.get(0).unwrap().input().to_vec();
+        for i in 1..len {
+            let _ = ds.get(i).unwrap();
+        }
+        let ep1_first = ds.get(0).unwrap().input().to_vec();
+        assert_ne!(ep0_first, ep1_first, "expected epoch 1 jitter to shift chunk offset");
     }
 
     #[test]

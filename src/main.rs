@@ -82,6 +82,12 @@ struct TrainArgs {
     /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
     #[arg(long, default_value_t = 10000.0)]
     rope_theta: f64,
+    /// Enable learnable RMSNorm on Q and K after RoPE (stabilizes higher learning rates)
+    #[arg(long)]
+    qk_norm: bool,
+    /// Output logit softcap (`cap * tanh(logits / cap)`). 0.0 = disabled (e.g. 15.0)
+    #[arg(long, default_value_t = 0.0)]
+    logit_softcap: f64,
     /// Floating-point precision (f32, flex32, bf16, f16).
     /// flex32 uses FP16 Tensor Cores with FP32 storage/accumulation (recommended on T4/wgpu);
     /// bf16 halves VRAM on Ampere+ GPUs (L4/A100/H100).
@@ -209,6 +215,8 @@ fn main() -> anyhow::Result<()> {
                 resume,
                 optimizer,
                 rope_theta,
+                qk_norm,
+                logit_softcap,
                 dtype,
                 amp,
                 grad_accum_steps,
@@ -228,6 +236,8 @@ fn main() -> anyhow::Result<()> {
                 block_size: block_size.unwrap_or(preset_cfg.block_size),
                 dropout: dropout.unwrap_or(preset_cfg.dropout),
                 rope_theta,
+                qk_norm,
+                logit_softcap,
             };
             gpt_config.validate()?;
 

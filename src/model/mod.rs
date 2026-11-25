@@ -30,6 +30,12 @@ pub struct GPTConfig {
     /// RoPE frequency base (10000.0 = original paper; nanochat uses 100000.0)
     #[config(default = 10000.0)]
     pub rope_theta: f64,
+    /// Apply learnable RMSNorm to Q and K after RoPE (stabilizes high learning rates).
+    #[config(default = false)]
+    pub qk_norm: bool,
+    /// Output logit softcap (`cap * tanh(logits / cap)`). `0.0` = disabled (e.g. `15.0` for nanochat).
+    #[config(default = 0.0)]
+    pub logit_softcap: f64,
 }
 
 impl GPTConfig {
@@ -71,6 +77,12 @@ impl GPTConfig {
         }
         if !self.rope_theta.is_finite() || self.rope_theta <= 0.0 {
             anyhow::bail!("rope_theta must be finite and > 0.0, got {}", self.rope_theta);
+        }
+        if !self.logit_softcap.is_finite() || self.logit_softcap < 0.0 {
+            anyhow::bail!(
+                "logit_softcap must be finite and >= 0.0, got {}",
+                self.logit_softcap
+            );
         }
         Ok(())
     }
@@ -162,6 +174,7 @@ pub struct GPT {
     rope: RotaryCache,
     blocks: Vec<Block>,
     ln_f: RmsNorm,
+    logit_softcap: f64,
 }
 
 impl GPT {
@@ -187,6 +200,7 @@ impl GPT {
             rope,
             blocks,
             ln_f,
+            logit_softcap: config.logit_softcap,
         }
     }
 
@@ -196,9 +210,16 @@ impl GPT {
         let x = self.ln_f.forward(x);
         let weight = self.token_embedding.weight.val();
         let [vocab_size, n_embd] = weight.dims();
-        x.reshape([batch * seq_len, n_embd])
+        let logits = x
+            .reshape([batch * seq_len, n_embd])
             .matmul(weight.transpose())
-            .reshape([batch, seq_len, vocab_size])
+            .reshape([batch, seq_len, vocab_size]);
+        if self.logit_softcap > 0.0 {
+            let cap = self.logit_softcap;
+            (logits / cap).tanh() * cap
+        } else {
+            logits
+        }
     }
 
     #[inline]
@@ -407,6 +428,8 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 0.0,
         }
     }
 
@@ -517,6 +540,8 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 0.0,
         };
         let gpt = GPT::new(&config, &device);
 
@@ -544,6 +569,8 @@ mod tests {
             block_size: 16,
             dropout: 0.0,
             rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 0.0,
         };
         let gpt = GPT::new(&config, &device);
 
@@ -590,6 +617,8 @@ mod tests {
             block_size: seq_len,
             dropout: 0.0,
             rope_theta: 10000.0,
+            qk_norm: false,
+            logit_softcap: 0.0,
         };
         let gpt = GPT::new(&config, &device);
 
@@ -713,5 +742,28 @@ mod tests {
         for &tok in data.as_slice::<i32>().unwrap() {
             assert!((0..50).contains(&tok), "sampled padded token {tok} >= 50");
         }
+    }
+
+    #[test]
+    fn qk_norm_and_logit_softcap_bound_logits_and_preserve_kv_cache() {
+        let device = test_device();
+        let mut config = create_test_config();
+        config.qk_norm = true;
+        config.logit_softcap = 2.0;
+        let gpt = GPT::new(&config, &device);
+
+        let prompt = Tensor::<1, Int>::arange(0..6_i64, &device).reshape([1, 6]);
+        let full = gpt.forward(prompt.clone());
+        let max_abs: f32 = full.clone().abs().max().into_scalar();
+        assert!(
+            max_abs <= 2.0 + 1e-5,
+            "logit softcap=2.0 violated: max |logit| = {max_abs}"
+        );
+
+        let expected_last = full.slice([0..1, 5..6]);
+        let (_, cache) = gpt.forward_cached(prompt.clone().slice([0..1, 0..5]), None);
+        let (cached_last, _) = gpt.forward_cached(prompt.slice([0..1, 5..6]), Some(cache));
+        let diff: f32 = (expected_last - cached_last).abs().sum().into_scalar();
+        assert!(diff < 1e-4, "QK-norm + softcap KV cache mismatch: {diff}");
     }
 }

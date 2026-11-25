@@ -50,13 +50,52 @@ Options:
   --grad-accum-steps <N>  Gradient accumulation steps   [default: 1]
   --grad-checkpointing    Enable activation checkpointing to save VRAM
   --rope-theta <F>        RoPE frequency base           [default: 10000.0]
+  --qk-norm               Enable learnable RMSNorm on Q and K after RoPE
+  --logit-softcap <F>     Output logit softcap (0=off)  [default: 0.0]
   --dtype <DTYPE>         Precision: f32, flex32, bf16, f16 [default: f32]
   --amp                   Shorthand for --dtype flex32 (FP16 Tensor Cores + FP32 storage)
   --multi-gpu <MODE>      Multi-GPU mode: auto, sharded, ddp, off [default: auto]
-  --no-tui                Disable interactive TUI; print plain CLI logs
+  --no-tui                Disable interactive TUI; print compact CLI progress logs
 ```
 
 Saves `artifacts/model_final.bpk`, `artifacts/model_best.bpk` (best validation perplexity), and `artifacts/config.json` on completion.
+
+### `eval`
+
+```
+cargo run --release -- eval [OPTIONS]
+
+Options:
+  --artifact-dir <PATH>   Where to load model from             [default: artifacts]
+  --dataset <NAME>        Built-in dataset val split           [default: shakespeare]
+  --file <PATH>           Custom UTF-8 text file (overrides --dataset)
+  --batch-size <N>        Evaluation batch size                [default: 8]
+  --max-items <N>         Cap evaluated chunks (0 = full)      [default: 0]
+  --dtype <DTYPE>         Precision: f32, flex32, bf16, f16    [default: f32]
+  --best                  Load model_best.bpk instead of model_final.bpk
+```
+
+Reports **Loss**, **Perplexity**, and exact **Bits-Per-Byte (BPB)**.
+
+### `bench`
+
+```
+cargo run --release -- bench [OPTIONS]
+
+Options:
+  --model <PRESET>        Model size preset                    [default: gpt2-small]
+  --block-size <N>        Context window size                  [default: 256]
+  --batch-size <N>        Batch size for eval/train            [default: 4]
+  --optimizer <NAME>      Optimizer: adamw, muon               [default: adamw]
+  --dtype <DTYPE>         Precision: f32, flex32, bf16, f16    [default: f32]
+  --warmup <N>            Warmup steps before timing           [default: 3]
+  --steps <N>             Timed steps for eval/train           [default: 10]
+  --decode-tokens <N>     Tokens to generate in decode bench   [default: 64]
+  --qk-norm               Enable QK-Norm
+  --logit-softcap <F>     Output logit softcap (0 = off)       [default: 0.0]
+```
+
+Measures **Eval**, **Train**, and **KV-cache Decode** throughput on your local GPU (`wgpu`/Metal or CUDA) or `--cpu`.
 
 ### `generate`
 
@@ -80,11 +119,11 @@ Options:
 
 | `--model`     | Layers | Heads | Embd | Context | ~Params |
 |---------------|--------|-------|------|---------|---------|
-| `nano`        | 2      | 4     | 64   | 32      | <1M     |
-| `gpt2-small`  | 12     | 12    | 768  | 1024    | 117M    |
-| `gpt2-medium` | 24     | 16    | 1024 | 1024    | 345M    |
-| `gpt2-large`  | 36     | 20    | 1280 | 1024    | 762M    |
-| `gpt2-xl`     | 48     | 25    | 1600 | 1024    | 1.5B    |
+| `nano`        | 2      | 4     | 64   | 32      | 3.3M    |
+| `gpt2-small`  | 12     | 12    | 768  | 1024    | 124M    |
+| `gpt2-medium` | 24     | 16    | 1024 | 1024    | 354M    |
+| `gpt2-large`  | 36     | 20    | 1280 | 1024    | 772M    |
+| `gpt2-xl`     | 48     | 25    | 1600 | 1024    | 1.56B   |
 
 Individual fields can be overridden: `--model gpt2-small --n-layer 8`
 
@@ -133,30 +172,36 @@ Open [`colab.ipynb`](colab.ipynb) in Google Colab with a GPU runtime (**Runtime 
 
 ### Architecture
 
-Standard decoder-only Transformer (nanoGPT style):
+Standard decoder-only Transformer (nanoGPT / nanochat style):
 
-- **Tokenizer**: GPT-2 BPE via tiktoken-rs (r50k_base, 50257 vocab); BOS token prepended
-- **Embedding**: token embedding only, weight-tied to output projection; RoPE replaces learned position embeddings
-- **Blocks**: `n_layer` × (causal self-attention + MLP), pre-norm with RMSNorm (`burn::nn::RmsNorm`)
-- **Attention**: multi-head causal self-attention with grouped-query attention (GQA) and RoPE; dropout-free fused kernel
-- **MLP**: `n_embd → 4·n_embd → n_embd` with Squared ReLU activation
-- **Init**: Normal(0, 0.02) weights; scaled residual init (0.02/√(2·n_layer))
-- **Optimizer**: AdamW with gradient clipping (norm 1.0), weight decay 0.1, cosine LR + linear warmup
-- **Generation**: GPU-accelerated categorical sampling with top-k and top-p; KV-cached autoregressive decoding
+- **Tokenizer**: GPT-2 BPE via `tiktoken-rs` (`r50k_base`, `50257` vocab, padded to `50304` for 64-aligned CUDA matmuls; BOS token prepended; padded slots masked during sampling)
+- **Embedding**: token embedding only, weight-tied to output projection; shared `RotaryCache` (RoPE) on `GPT` replaces learned position embeddings
+- **Blocks**: `n_layer` × (causal self-attention + MLP), pre-norm with RMSNorm (`burn::nn::RmsNorm`), optional QK-Norm (`--qk-norm`) and output logit softcap (`--logit-softcap`)
+- **Attention**: multi-head causal self-attention with grouped-query attention (GQA), zero-copy `split_qkv`, and precomputed autodiff causal mask
+- **MLP**: `n_embd → 4·n_embd → n_embd` with fused Squared ReLU (`clamp_min(0.0).square()`)
+- **Init**: `Normal(0, 0.02)` weights; scaled residual init (`0.02/√(2·n_layer)`)
+- **Optimizer**: AdamW or hybrid Muon + AdamW (`--optimizer muon`), 0.0 weight decay on 1D norms, gradient clipping (norm 1.0), cosine LR + linear warmup
+- **Generation**: 100% on-device GPU top-k/top-p/repetition-penalty sampling; pre-allocated in-place KV cache with sliding-window roll-over past `block_size`
 
 ## Project Layout
 
 ```
 src/
-  main.rs       CLI entry point
-  lib.rs        Module declarations
-  data.rs       BPE tokenizer, dataset, batching
+  main.rs          CLI entry point (train, eval, generate, bench)
+  lib.rs           Public library exports
+  data.rs          BPE tokenizer, zero-copy Arc<[i32]> dataset + chunk jitter, single-H2D batcher
+  datasets.rs      Dataset registry (download + canonical train/valid splits)
+  eval.rs          Checkpoint evaluation (Loss, Perplexity, exact Bits-Per-Byte)
+  bench.rs         Local GPU/CPU throughput benchmark (eval, train, decode)
+  inference.rs     UTF-8 streaming text generation and model loading
+  presets.rs       Model size presets (nano, GPT-2 family)
   model/
-    mod.rs      GPT, Block, MLP, RMSNorm
-    attention.rs CausalSelfAttention, KV cache
-    sampling.rs SamplingParams, sample_token, filter_top_k_p
-  train.rs      Training loop (Burn SupervisedTraining)
-  inference.rs  Text generation and model loading
-  datasets.rs   Dataset registry (download + preprocessing)
-  presets.rs    Model size presets (nano, GPT-2 family)
+    mod.rs         GPT, Block, MLP, RMSNorm, sliding-window generate
+    attention.rs   RotaryCache/RotarySlice, CausalSelfAttention, in-place KVCache
+    sampling.rs    SamplingParams, GPU top-k/top-p/repetition-penalty sampling
+  train/
+    mod.rs         Training loop, optimizer param groups, best-checkpoint export
+    scheduler.rs   WarmupCosineScheduler
+    metrics.rs     Deadlock-free ScalarLossOutput, ScalarLossMetric, LossPerplexityMetric
+    renderer.rs    Compact headless CLI metrics renderer
 ```
